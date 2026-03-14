@@ -154,6 +154,11 @@ uuid_audio_stream <uuid> stop <metadata>
 Stops audio stream and closes websocket connection. If _metadata_ is provided it will be sent before the connection is closed.
 
 ```
+uuid_audio_stream <uuid> playback_stop
+```
+Stops active inbound live playback immediately without closing the websocket connection. This is intended for interrupting TTS or other binary playback already buffered in the module.
+
+```
 uuid_audio_stream <uuid> pause
 ```
 Pauses audio stream
@@ -295,5 +300,6 @@ To interrupt active live playback immediately, send:
   "type": "cancel_tts"
 }
 ```
+This is a websocket control message from the remote service to `mod_audio_stream`, not a FreeSWITCH API command.
 
-Live binary playback is normalized into the channel's native playback format, buffered in memory, and played through an internal FreeSWITCH stream source. The internal stream source is not part of the public module API.
+Live binary playback is normalized into the channel's native playback format, buffered in memory, and written back to the channel on the module's internal playout clock. `streamAudioEnd` marks the current playback stream as draining; any binary frames that arrive before the next `streamAudioBegin` are still accepted and drained. To cut playback immediately from FreeSWITCH, call `uuid_audio_stream <uuid> playback_stop`. Remote services can also interrupt playback by sending the websocket `cancel_tts` control message shown above.
