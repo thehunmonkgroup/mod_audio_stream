@@ -3,6 +3,7 @@
  */
 #include "mod_audio_stream.h"
 #include "audio_streamer_glue.h"
+#include "inbound_playback.h"
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_audio_stream_runtime);
@@ -43,7 +44,6 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
-            break;
 
         case SWITCH_ABC_TYPE_WRITE:
         default:
@@ -136,7 +136,28 @@ static switch_status_t send_text(switch_core_session_t *session, char* text) {
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+static switch_status_t do_playback_stop(switch_core_session_t *session) {
+    switch_status_t status = SWITCH_STATUS_FALSE;
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
+
+    if (!bug) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed playback_stop.\n");
+        return status;
+    }
+
+    private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
+    if (!tech_pvt) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no private data, failed playback_stop.\n");
+        return status;
+    }
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_stop\n");
+    status = inbound_playback_cancel(session, tech_pvt);
+    return status;
+}
+
+#define STREAM_API_SYNTAX "<uuid> [start | stop | playback_stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -165,6 +186,8 @@ SWITCH_STANDARD_API(stream_function)
                     goto done;
                 }
                 status = do_stop(lsession, argc > 2 ? argv[2] : NULL);
+            } else if (!strcasecmp(argv[1], "playback_stop")) {
+                status = do_playback_stop(lsession);
             } else if (!strcasecmp(argv[1], "pause")) {
                 status = do_pauseresume(lsession, 1);
             } else if (!strcasecmp(argv[1], "resume")) {
@@ -259,14 +282,17 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     if (switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_CONNECT) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
-        switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS) {
+        switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
+        switch_event_reserve_subclass(EVENT_PLAY) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_stream API.\n");
         return SWITCH_STATUS_TERM;
     }
+
     SWITCH_ADD_API(api_interface, "uuid_audio_stream", "audio_stream API", stream_function, STREAM_API_SYNTAX);
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url metadata");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid stop");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid playback_stop");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid pause");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid resume");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid send_text");
@@ -286,6 +312,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown)
     switch_event_free_subclass(EVENT_CONNECT);
     switch_event_free_subclass(EVENT_DISCONNECT);
     switch_event_free_subclass(EVENT_ERROR);
+    switch_event_free_subclass(EVENT_PLAY);
 
     return SWITCH_STATUS_SUCCESS;
 }

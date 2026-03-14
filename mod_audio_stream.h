@@ -23,6 +23,7 @@ struct private_data {
     SpeexResamplerState *resampler;
     responseHandler_t responseHandler;
     void *pAudioStreamer;
+    void *pInboundPlayback;
     char ws_uri[MAX_WS_URI];
     int sampling;
     int channels;

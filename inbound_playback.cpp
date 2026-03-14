@@ -1,0 +1,915 @@
+#include "inbound_playback.h"
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t kDefaultMaxBufferMs = 5000;
+constexpr uint32_t kDefaultPrerollMs = 60;
+
+enum class PlaybackState {
+    Idle,
+    Preroll,
+    Playing,
+    Draining,
+    Cancelled,
+    Closed
+};
+
+class ByteRingBuffer {
+public:
+    explicit ByteRingBuffer(size_t capacity)
+        : buffer_(capacity, 0), capacity_(capacity) {}
+
+    size_t size() const {
+        return size_;
+    }
+
+    size_t capacity() const {
+        return capacity_;
+    }
+
+    void clear() {
+        head_ = 0;
+        size_ = 0;
+    }
+
+    size_t writable_size() const {
+        return capacity_ - size_;
+    }
+
+    size_t write(const uint8_t *data, size_t len) {
+        if (!capacity_ || !data || !len) {
+            return 0;
+        }
+
+        const size_t to_write = std::min(len, writable_size());
+        if (!to_write) {
+            return 0;
+        }
+
+        size_t tail = (head_ + size_) % capacity_;
+        const size_t first = std::min(to_write, capacity_ - tail);
+        std::memcpy(buffer_.data() + tail, data, first);
+
+        if (to_write > first) {
+            std::memcpy(buffer_.data(), data + first, to_write - first);
+        }
+
+        size_ += to_write;
+        return to_write;
+    }
+
+    size_t read(uint8_t *data, size_t len) {
+        if (!data || !len || !size_) {
+            return 0;
+        }
+
+        const size_t to_read = std::min(len, size_);
+        const size_t first = std::min(to_read, capacity_ - head_);
+        std::memcpy(data, buffer_.data() + head_, first);
+
+        if (to_read > first) {
+            std::memcpy(data + first, buffer_.data(), to_read - first);
+        }
+
+        head_ = (head_ + to_read) % capacity_;
+        size_ -= to_read;
+        return to_read;
+    }
+
+private:
+    std::vector<uint8_t> buffer_;
+    size_t capacity_ = 0;
+    size_t head_ = 0;
+    size_t size_ = 0;
+};
+
+struct InboundPlaybackState {
+    InboundPlaybackState(
+        std::string session_id,
+        uint32_t target_rate,
+        uint32_t target_channels,
+        uint32_t packet_ms,
+        size_t packet_bytes,
+        size_t packet_samples,
+        size_t max_buffer_bytes,
+        size_t preroll_bytes
+    )
+        : session_id(std::move(session_id)),
+          target_rate(target_rate),
+          target_channels(target_channels),
+          packet_ms(packet_ms),
+          packet_bytes(packet_bytes),
+          packet_samples(packet_samples),
+          max_buffer_bytes(max_buffer_bytes),
+          preroll_bytes(preroll_bytes),
+          buffer(max_buffer_bytes),
+          frame_buffer(packet_bytes, 0) {}
+
+    ~InboundPlaybackState() {
+        if (resampler) {
+            speex_resampler_destroy(resampler);
+            resampler = nullptr;
+        }
+
+        if (codec_initialized) {
+            switch_core_codec_destroy(&raw_codec);
+            codec_initialized = false;
+        }
+    }
+
+    std::string session_id;
+    uint32_t target_rate = 8000;
+    uint32_t target_channels = 1;
+    uint32_t packet_ms = 20;
+    size_t packet_bytes = 0;
+    size_t packet_samples = 0;
+    size_t max_buffer_bytes = 0;
+    size_t preroll_bytes = 0;
+    ByteRingBuffer buffer;
+    std::vector<uint8_t> pending_input;
+    std::vector<uint8_t> frame_buffer;
+    std::mutex mutex;
+    SpeexResamplerState *resampler = nullptr;
+    switch_codec_t raw_codec = {};
+    uint32_t source_rate = 0;
+    uint32_t source_channels = 0;
+    uint64_t generation = 0;
+    PlaybackState state = PlaybackState::Idle;
+    bool closed = false;
+    bool debug_enabled = false;
+    bool codec_initialized = false;
+    uint64_t append_calls = 0;
+    uint64_t write_calls = 0;
+    uint64_t zero_fill_writes = 0;
+    uint64_t total_input_bytes = 0;
+    uint64_t total_output_bytes = 0;
+    size_t max_buffer_observed = 0;
+    bool first_binary_logged = false;
+    bool first_tick_logged = false;
+    bool first_nonzero_write_logged = false;
+    bool first_read_frame_logged = false;
+    bool thread_started_logged = false;
+    bool thread_exit_logged = false;
+    uint64_t read_frame_calls = 0;
+    uint64_t timer_ticks = 0;
+    bool first_timer_tick_logged = false;
+    uint64_t overflow_events = 0;
+    uint64_t dropped_output_bytes = 0;
+};
+
+uint32_t get_channel_var_ms(switch_channel_t *channel, const char *name, uint32_t fallback) {
+    const char *value = switch_channel_get_variable(channel, name);
+    if (zstr(value)) {
+        return fallback;
+    }
+
+    const int parsed = std::atoi(value);
+    if (parsed <= 0) {
+        return fallback;
+    }
+
+    return static_cast<uint32_t>(parsed);
+}
+
+size_t bytes_for_ms(uint32_t rate, uint32_t channels, uint32_t ms) {
+    return static_cast<size_t>(rate) * static_cast<size_t>(channels) * sizeof(int16_t) * static_cast<size_t>(ms) / 1000;
+}
+
+const char *playback_state_name(PlaybackState state) {
+    switch (state) {
+        case PlaybackState::Idle:
+            return "idle";
+        case PlaybackState::Preroll:
+            return "preroll";
+        case PlaybackState::Playing:
+            return "playing";
+        case PlaybackState::Draining:
+            return "draining";
+        case PlaybackState::Cancelled:
+            return "cancelled";
+        case PlaybackState::Closed:
+            return "closed";
+    }
+
+    return "unknown";
+}
+
+std::shared_ptr<InboundPlaybackState> get_state_shared(private_t *tech_pvt) {
+    if (!tech_pvt) {
+        return {};
+    }
+
+    auto *state_ptr = static_cast<std::shared_ptr<InboundPlaybackState> *>(tech_pvt->pInboundPlayback);
+    if (!state_ptr || !(*state_ptr)) {
+        return {};
+    }
+
+    return *state_ptr;
+}
+
+InboundPlaybackState *get_state(private_t *tech_pvt) {
+    auto state = get_state_shared(tech_pvt);
+    return state.get();
+}
+
+switch_status_t configure_resampler(InboundPlaybackState *state) {
+    if (!state) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    if (state->resampler) {
+        speex_resampler_destroy(state->resampler);
+        state->resampler = nullptr;
+    }
+
+    if (state->source_channels != 1 || !state->source_rate || !state->target_rate) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    if (state->source_rate == state->target_rate) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    int err = 0;
+    state->resampler = speex_resampler_init(1, state->source_rate, state->target_rate, SWITCH_RESAMPLE_QUALITY, &err);
+    if (err != RESAMPLER_ERR_SUCCESS || !state->resampler) {
+        state->resampler = nullptr;
+        return SWITCH_STATUS_FALSE;
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+std::vector<int16_t> normalize_samples(InboundPlaybackState *state, const int16_t *samples, size_t sample_count) {
+    std::vector<int16_t> mono_output;
+
+    if (!state || !samples || !sample_count || state->source_channels != 1) {
+        return mono_output;
+    }
+
+    if (state->source_rate == state->target_rate) {
+        mono_output.assign(samples, samples + sample_count);
+    } else {
+        size_t output_capacity = (sample_count * state->target_rate) / state->source_rate + 8;
+        if (!output_capacity) {
+            output_capacity = 8;
+        }
+
+        mono_output.resize(output_capacity);
+        spx_uint32_t in_len = static_cast<spx_uint32_t>(sample_count);
+        spx_uint32_t out_len = static_cast<spx_uint32_t>(mono_output.size());
+        speex_resampler_process_int(state->resampler, 0, samples, &in_len, mono_output.data(), &out_len);
+        mono_output.resize(out_len);
+    }
+
+    if (state->target_channels == 1) {
+        return mono_output;
+    }
+
+    if (state->target_channels != 2) {
+        return {};
+    }
+
+    std::vector<int16_t> stereo_output(mono_output.size() * 2);
+    for (size_t i = 0; i < mono_output.size(); ++i) {
+        stereo_output[i * 2] = mono_output[i];
+        stereo_output[i * 2 + 1] = mono_output[i];
+    }
+
+    return stereo_output;
+}
+
+switch_status_t initialize_raw_codec(switch_core_session_t *session, InboundPlaybackState *state) {
+    if (!session || !state) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    if (state->codec_initialized) {
+        switch_core_codec_destroy(&state->raw_codec);
+        state->codec_initialized = false;
+    }
+
+    if (switch_core_codec_init(
+            &state->raw_codec,
+            "L16",
+            NULL,
+            NULL,
+            state->target_rate,
+            state->packet_ms,
+            state->target_channels,
+            SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+            NULL,
+            switch_core_session_get_pool(session)
+        ) != SWITCH_STATUS_SUCCESS) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    state->codec_initialized = true;
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t write_next_frame(switch_core_session_t *session, InboundPlaybackState *state) {
+    if (!session || !state) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    bool should_write = false;
+    bool wrote_audio = false;
+    bool should_log_completion = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+
+        if (state->state == PlaybackState::Idle || state->state == PlaybackState::Cancelled || state->state == PlaybackState::Closed) {
+            return SWITCH_STATUS_SUCCESS;
+        }
+
+        if (state->state == PlaybackState::Preroll && state->preroll_bytes && state->buffer.size() < std::min(state->preroll_bytes, state->packet_bytes)) {
+            return SWITCH_STATUS_SUCCESS;
+        }
+
+        state->write_calls++;
+
+        if (state->debug_enabled && !state->first_tick_logged) {
+            state->first_tick_logged = true;
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback first tick generation=%" PRIu64 " packet_bytes=%" SWITCH_SIZE_T_FMT " buffer=%" SWITCH_SIZE_T_FMT " state=%s\n",
+                state->session_id.c_str(),
+                state->generation,
+                static_cast<switch_size_t>(state->packet_bytes),
+                static_cast<switch_size_t>(state->buffer.size()),
+                playback_state_name(state->state)
+            );
+        }
+
+        const size_t bytes_read = state->buffer.read(state->frame_buffer.data(), state->packet_bytes);
+
+        if (bytes_read == 0) {
+            if (state->state == PlaybackState::Draining) {
+                state->state = PlaybackState::Idle;
+                should_log_completion = true;
+            }
+        } else {
+            if (bytes_read < state->packet_bytes) {
+                std::memset(state->frame_buffer.data() + bytes_read, 0, state->packet_bytes - bytes_read);
+                state->zero_fill_writes++;
+            }
+
+            if (state->state == PlaybackState::Preroll) {
+                state->state = PlaybackState::Playing;
+            }
+
+            state->total_output_bytes += bytes_read;
+            wrote_audio = true;
+            should_write = true;
+        }
+
+        if (!wrote_audio && (state->state == PlaybackState::Playing || state->state == PlaybackState::Preroll)) {
+            std::memset(state->frame_buffer.data(), 0, state->packet_bytes);
+            state->zero_fill_writes++;
+            should_write = true;
+        }
+
+        if (state->debug_enabled && wrote_audio && !state->first_nonzero_write_logged) {
+            state->first_nonzero_write_logged = true;
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback first nonzero write bytes=%" SWITCH_SIZE_T_FMT " zero_fill_writes=%" PRIu64 " state=%s\n",
+                state->session_id.c_str(),
+                static_cast<switch_size_t>(state->packet_bytes),
+                state->zero_fill_writes,
+                playback_state_name(state->state)
+            );
+        }
+
+        if (state->debug_enabled && ((state->write_calls % 50) == 0)) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback write checkpoint generation=%" PRIu64 " writes=%" PRIu64 " buffer=%" SWITCH_SIZE_T_FMT " total_out=%" PRIu64 " zero_fill=%" PRIu64 " state=%s\n",
+                state->session_id.c_str(),
+                state->generation,
+                state->write_calls,
+                static_cast<switch_size_t>(state->buffer.size()),
+                state->total_output_bytes,
+                state->zero_fill_writes,
+                playback_state_name(state->state)
+            );
+        }
+    }
+
+    if (should_log_completion && state->debug_enabled) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback complete generation=%" PRIu64 " writes=%" PRIu64 " total_in=%" PRIu64 " total_out=%" PRIu64 "\n",
+            state->session_id.c_str(),
+            state->generation,
+            state->write_calls,
+            state->total_input_bytes,
+            state->total_output_bytes
+        );
+    }
+
+    if (!should_write) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_frame_t write_frame = {};
+    write_frame.codec = &state->raw_codec;
+    write_frame.data = state->frame_buffer.data();
+    write_frame.buflen = static_cast<uint32_t>(state->frame_buffer.size());
+    write_frame.datalen = static_cast<uint32_t>(state->packet_bytes);
+    write_frame.samples = static_cast<uint32_t>(state->packet_samples);
+    write_frame.rate = state->target_rate;
+
+    if (switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0) != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_WARNING,
+            "(%s) inbound playback write_frame failed generation=%" PRIu64 "\n",
+            state->session_id.c_str(),
+            state->generation
+        );
+        return SWITCH_STATUS_FALSE;
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+void playout_loop(std::shared_ptr<InboundPlaybackState> state) {
+    if (!state) {
+        return;
+    }
+
+    switch_core_session_t *session = switch_core_session_locate(state->session_id.c_str());
+    if (!session) {
+        switch_log_printf(
+            SWITCH_CHANNEL_LOG,
+            SWITCH_LOG_WARNING,
+            "(%s) inbound playback thread failed to locate session\n",
+            state->session_id.c_str()
+        );
+        return;
+    }
+
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    switch_timer_t timer = {};
+    bool timer_initialized = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->debug_enabled && !state->thread_started_logged) {
+            state->thread_started_logged = true;
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback thread started target_rate=%u target_channels=%u packet_bytes=%" SWITCH_SIZE_T_FMT "\n",
+                state->session_id.c_str(),
+                state->target_rate,
+                state->target_channels,
+                static_cast<switch_size_t>(state->packet_bytes)
+            );
+        }
+    }
+
+    if (switch_core_timer_init(&timer, "soft", static_cast<int>(state->packet_ms), static_cast<int>(state->packet_samples), switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_WARNING,
+            "(%s) inbound playback timer init failed packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
+            state->session_id.c_str(),
+            state->packet_ms,
+            static_cast<switch_size_t>(state->packet_samples)
+        );
+        switch_core_session_rwunlock(session);
+        return;
+    }
+    timer_initialized = true;
+    switch_core_timer_sync(&timer);
+
+    switch_status_t final_status = SWITCH_STATUS_SUCCESS;
+
+    while (switch_channel_ready(channel)) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->closed) {
+                break;
+            }
+        }
+
+        const switch_status_t status = switch_core_timer_next(&timer);
+        if (status != SWITCH_STATUS_SUCCESS) {
+            final_status = status;
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->timer_ticks++;
+            if (state->debug_enabled && !state->first_timer_tick_logged) {
+                state->first_timer_tick_logged = true;
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) inbound playback first timer tick packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
+                    state->session_id.c_str(),
+                    state->packet_ms,
+                    static_cast<switch_size_t>(state->packet_samples)
+                );
+            }
+            if (state->debug_enabled && ((state->timer_ticks % 50) == 0)) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) inbound playback timer checkpoint ticks=%" PRIu64 " state=%s\n",
+                    state->session_id.c_str(),
+                    state->timer_ticks,
+                    playback_state_name(state->state)
+                );
+            }
+        }
+
+        if (write_next_frame(session, state.get()) != SWITCH_STATUS_SUCCESS) {
+            final_status = SWITCH_STATUS_FALSE;
+            break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->debug_enabled && !state->thread_exit_logged) {
+            state->thread_exit_logged = true;
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback thread exiting status=%d channel_ready=%d closed=%d ticks=%" PRIu64 " writes=%" PRIu64 "\n",
+                state->session_id.c_str(),
+                final_status,
+                switch_channel_ready(channel) ? 1 : 0,
+                state->closed ? 1 : 0,
+                state->timer_ticks,
+                state->write_calls
+            );
+        }
+    }
+
+    if (timer_initialized) {
+        switch_core_timer_destroy(&timer);
+    }
+
+    switch_core_session_rwunlock(session);
+}
+
+}  // namespace
+
+extern "C" {
+
+switch_status_t inbound_playback_session_init(switch_core_session_t *session, private_t *tech_pvt) {
+    if (!session || !tech_pvt) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    switch_codec_implementation_t read_impl;
+    std::memset(&read_impl, 0, sizeof(read_impl));
+    switch_core_session_get_read_impl(session, &read_impl);
+
+    const uint32_t target_rate = read_impl.actual_samples_per_second ? read_impl.actual_samples_per_second : 8000;
+    const uint32_t target_channels = read_impl.number_of_channels ? read_impl.number_of_channels : 1;
+    const uint32_t packet_ms = read_impl.microseconds_per_packet ? (read_impl.microseconds_per_packet / 1000) : 20;
+    const size_t packet_bytes =
+        read_impl.decoded_bytes_per_packet ?
+            static_cast<size_t>(read_impl.decoded_bytes_per_packet) :
+            bytes_for_ms(target_rate, target_channels, packet_ms);
+    const size_t packet_samples =
+        packet_bytes / (sizeof(int16_t) * static_cast<size_t>(target_channels ? target_channels : 1));
+
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    const uint32_t max_buffer_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS", kDefaultMaxBufferMs);
+    const uint32_t preroll_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_PREROLL_MS", kDefaultPrerollMs);
+
+    auto state = std::make_shared<InboundPlaybackState>(
+        tech_pvt->sessionId,
+        target_rate,
+        target_channels,
+        packet_ms,
+        packet_bytes,
+        packet_samples,
+        bytes_for_ms(target_rate, target_channels, max_buffer_ms),
+        bytes_for_ms(target_rate, target_channels, preroll_ms)
+    );
+
+    state->debug_enabled = switch_channel_var_true(channel, "STREAM_LIVE_PLAYBACK_DEBUG");
+
+    if (initialize_raw_codec(session, state.get()) != SWITCH_STATUS_SUCCESS) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    tech_pvt->pInboundPlayback = new std::shared_ptr<InboundPlaybackState>(state);
+
+    std::thread(playout_loop, state).detach();
+
+    if (state->debug_enabled) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback session_init target_rate=%u target_channels=%u packet_ms=%u packet_bytes=%" SWITCH_SIZE_T_FMT " packet_samples=%" SWITCH_SIZE_T_FMT " max_buffer_ms=%u preroll_ms=%u max_buffer_bytes=%" SWITCH_SIZE_T_FMT " preroll_bytes=%" SWITCH_SIZE_T_FMT "\n",
+            tech_pvt->sessionId,
+            target_rate,
+            target_channels,
+            packet_ms,
+            static_cast<switch_size_t>(packet_bytes),
+            static_cast<switch_size_t>(packet_samples),
+            max_buffer_ms,
+            preroll_ms,
+            static_cast<switch_size_t>(state->max_buffer_bytes),
+            static_cast<switch_size_t>(state->preroll_bytes)
+        );
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+void inbound_playback_session_cleanup(switch_core_session_t *session, private_t *tech_pvt) {
+    auto state = get_state_shared(tech_pvt);
+    if (!state) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->debug_enabled) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) inbound playback cleanup generation=%" PRIu64 " state=%s writes=%" PRIu64 " zero_fill=%" PRIu64 " total_in=%" PRIu64 " total_out=%" PRIu64 "\n",
+                state->session_id.c_str(),
+                state->generation,
+                playback_state_name(state->state),
+                state->write_calls,
+                state->zero_fill_writes,
+                state->total_input_bytes,
+                state->total_output_bytes
+            );
+        }
+
+        state->closed = true;
+        state->state = PlaybackState::Closed;
+        state->buffer.clear();
+        state->pending_input.clear();
+    }
+
+    auto *state_ptr = static_cast<std::shared_ptr<InboundPlaybackState> *>(tech_pvt->pInboundPlayback);
+    tech_pvt->pInboundPlayback = nullptr;
+    delete state_ptr;
+}
+
+switch_status_t inbound_playback_start(
+    switch_core_session_t *session,
+    private_t *tech_pvt,
+    uint32_t source_rate,
+    uint32_t source_channels
+) {
+    auto state = get_state_shared(tech_pvt);
+    if (!session || !state || source_channels != 1) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->generation++;
+        state->source_rate = source_rate ? source_rate : state->target_rate;
+        state->source_channels = source_channels;
+        state->buffer.clear();
+        state->pending_input.clear();
+        state->state = PlaybackState::Preroll;
+        state->closed = false;
+        state->append_calls = 0;
+        state->write_calls = 0;
+        state->zero_fill_writes = 0;
+        state->total_input_bytes = 0;
+        state->total_output_bytes = 0;
+        state->max_buffer_observed = 0;
+        state->overflow_events = 0;
+        state->dropped_output_bytes = 0;
+        state->first_binary_logged = false;
+        state->first_tick_logged = false;
+        state->first_nonzero_write_logged = false;
+        state->first_read_frame_logged = false;
+        state->first_timer_tick_logged = false;
+        state->timer_ticks = 0;
+
+        if (configure_resampler(state.get()) != SWITCH_STATUS_SUCCESS) {
+            state->state = PlaybackState::Idle;
+            return SWITCH_STATUS_FALSE;
+        }
+    }
+
+    if (state->debug_enabled) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback begin generation=%" PRIu64 " source_rate=%u source_channels=%u target_rate=%u target_channels=%u packet_bytes=%" SWITCH_SIZE_T_FMT "\n",
+            tech_pvt->sessionId,
+            state->generation,
+            state->source_rate,
+            state->source_channels,
+            state->target_rate,
+            state->target_channels,
+            static_cast<switch_size_t>(state->packet_bytes)
+        );
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t inbound_playback_end(private_t *tech_pvt) {
+    auto state = get_state_shared(tech_pvt);
+    if (!state) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->state == PlaybackState::Idle || state->state == PlaybackState::Closed) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    state->state = PlaybackState::Draining;
+    if (state->debug_enabled) {
+        switch_log_printf(
+            SWITCH_CHANNEL_LOG,
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback end generation=%" PRIu64 " buffer=%" SWITCH_SIZE_T_FMT " append_calls=%" PRIu64 " total_in=%" PRIu64 "\n",
+            state->session_id.c_str(),
+            state->generation,
+            static_cast<switch_size_t>(state->buffer.size()),
+            state->append_calls,
+            state->total_input_bytes
+        );
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t inbound_playback_cancel(switch_core_session_t *session, private_t *tech_pvt) {
+    auto state = get_state_shared(tech_pvt);
+    if (!state) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->generation++;
+    state->buffer.clear();
+    state->pending_input.clear();
+    state->state = PlaybackState::Cancelled;
+
+    if (state->debug_enabled) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback cancel generation=%" PRIu64 "\n",
+            state->session_id.c_str(),
+            state->generation
+        );
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t inbound_playback_append(private_t *tech_pvt, const void *data, size_t len) {
+    auto state = get_state_shared(tech_pvt);
+    if (!state || !data || !len) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    if (state->state == PlaybackState::Idle || state->state == PlaybackState::Cancelled || state->state == PlaybackState::Closed) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    state->append_calls++;
+    state->total_input_bytes += len;
+
+    if (state->debug_enabled && state->state == PlaybackState::Draining) {
+        switch_log_printf(
+            SWITCH_CHANNEL_LOG,
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback received binary while draining generation=%" PRIu64 " payload_bytes=%" SWITCH_SIZE_T_FMT " buffer=%" SWITCH_SIZE_T_FMT "\n",
+            state->session_id.c_str(),
+            state->generation,
+            static_cast<switch_size_t>(len),
+            static_cast<switch_size_t>(state->buffer.size())
+        );
+    }
+
+    if (state->debug_enabled && !state->first_binary_logged) {
+        state->first_binary_logged = true;
+        switch_log_printf(
+            SWITCH_CHANNEL_LOG,
+            SWITCH_LOG_DEBUG,
+            "(%s) inbound playback first binary append generation=%" PRIu64 " payload_bytes=%" SWITCH_SIZE_T_FMT " state=%s\n",
+            state->session_id.c_str(),
+            state->generation,
+            static_cast<switch_size_t>(len),
+            playback_state_name(state->state)
+        );
+    }
+
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    state->pending_input.insert(state->pending_input.end(), bytes, bytes + len);
+
+    const size_t complete_bytes = state->pending_input.size() - (state->pending_input.size() % sizeof(int16_t));
+    if (!complete_bytes) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    std::vector<uint8_t> complete_input(state->pending_input.begin(), state->pending_input.begin() + complete_bytes);
+    state->pending_input.erase(state->pending_input.begin(), state->pending_input.begin() + complete_bytes);
+
+    const size_t sample_count = complete_input.size() / sizeof(int16_t);
+    std::vector<int16_t> input_samples(sample_count);
+    std::memcpy(input_samples.data(), complete_input.data(), complete_input.size());
+
+    std::vector<int16_t> normalized = normalize_samples(state.get(), input_samples.data(), input_samples.size());
+    if (normalized.empty()) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    const size_t normalized_size = normalized.size() * sizeof(int16_t);
+    const auto *normalized_bytes = reinterpret_cast<const uint8_t *>(normalized.data());
+    size_t dropped_bytes = 0;
+
+    if (state->buffer.size() == 0 && normalized_size > state->buffer.capacity()) {
+        const size_t written = state->buffer.write(normalized_bytes, state->buffer.capacity());
+        dropped_bytes = normalized_size - written;
+    } else {
+        const size_t written = state->buffer.write(normalized_bytes, normalized_size);
+        dropped_bytes = normalized_size - written;
+    }
+
+    if (dropped_bytes > 0) {
+        state->overflow_events++;
+        state->dropped_output_bytes += dropped_bytes;
+        if (state->debug_enabled) {
+            switch_log_printf(
+                SWITCH_CHANNEL_LOG,
+                SWITCH_LOG_WARNING,
+                "(%s) inbound playback overflow generation=%" PRIu64 " dropped_bytes=%" SWITCH_SIZE_T_FMT " buffer=%" SWITCH_SIZE_T_FMT " capacity=%" SWITCH_SIZE_T_FMT "\n",
+                state->session_id.c_str(),
+                state->generation,
+                static_cast<switch_size_t>(dropped_bytes),
+                static_cast<switch_size_t>(state->buffer.size()),
+                static_cast<switch_size_t>(state->buffer.capacity())
+            );
+        }
+    }
+
+    state->max_buffer_observed = std::max(state->max_buffer_observed, state->buffer.size());
+
+    if (state->state == PlaybackState::Preroll && (!state->preroll_bytes || state->buffer.size() >= state->preroll_bytes)) {
+        state->state = PlaybackState::Playing;
+    }
+
+    if (state->debug_enabled && ((state->append_calls % 25) == 0 || state->append_calls == 1)) {
+        switch_log_printf(
+            SWITCH_CHANNEL_LOG,
+            SWITCH_LOG_DEBUG,
+                "(%s) inbound playback append checkpoint generation=%" PRIu64 " append_calls=%" PRIu64 " payload_bytes=%" SWITCH_SIZE_T_FMT " normalized_bytes=%" SWITCH_SIZE_T_FMT " dropped_bytes=%" PRIu64 " buffer=%" SWITCH_SIZE_T_FMT " max_buffer=%" SWITCH_SIZE_T_FMT " state=%s\n",
+                state->session_id.c_str(),
+                state->generation,
+                state->append_calls,
+                static_cast<switch_size_t>(len),
+                static_cast<switch_size_t>(normalized_size),
+                state->dropped_output_bytes,
+                static_cast<switch_size_t>(state->buffer.size()),
+                static_cast<switch_size_t>(state->max_buffer_observed),
+                playback_state_name(state->state)
+        );
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t inbound_playback_tick(switch_core_session_t *session, private_t *tech_pvt) {
+    auto state = get_state_shared(tech_pvt);
+    if (!session || !state) {
+        return SWITCH_STATUS_SUCCESS;
+    }
+    return write_next_frame(session, state.get());
+}
+
+}  // extern "C"

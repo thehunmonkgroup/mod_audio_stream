@@ -1,15 +1,19 @@
 #include <string>
 #include <cstring>
 #include "mod_audio_stream.h"
+#include "inbound_playback.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
 #include <fstream>
 #include <switch_buffer.h>
 #include <unordered_set>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -35,7 +39,9 @@ public:
         return sp;
     }
 
-    ~AudioStreamer()= default;
+    ~AudioStreamer() {
+        stopInboundWorker();
+    }
 
     void disconnect() {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
@@ -76,7 +82,9 @@ public:
 
     void markCleanedUp() {
         m_cleanedUp.store(true, std::memory_order_release);
+        stopInboundWorker();
         client.setMessageCallback({});
+        client.setBinaryCallback({});
         client.setOpenCallback({});
         client.setErrorCallback({});
         client.setCloseCallback({});
@@ -144,12 +152,25 @@ private:
         // Set extra headers if any
         if(!hdrs.empty())
             client.setHeaders(hdrs);
+
+        m_inboundWorker = std::thread(&AudioStreamer::processInboundQueue, this);
     }
 
     struct ProcessResult {
         switch_bool_t ok = SWITCH_FALSE;
         std::string rewrittenJsonData;
         std::vector<std::string> errors;
+    };
+
+    enum class InboundMessageType {
+        Text,
+        Binary
+    };
+
+    struct InboundMessage {
+        InboundMessageType type;
+        std::string text;
+        std::vector<uint8_t> binary;
     };
 
     static inline void push_err(ProcessResult& out, const std::string& sid, const std::string& s) {
@@ -161,7 +182,14 @@ private:
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
-            self->eventCallback(MESSAGE, message.c_str());
+            self->enqueueText(message);
+        });
+
+        client.setBinaryCallback([wp](const void* data, size_t len) {
+            auto self = wp.lock();
+            if (!self) return;
+            if (self->isCleanedUp()) return;
+            self->enqueueBinary(data, len);
         });
 
         client.setOpenCallback([wp]() {
@@ -173,7 +201,7 @@ private:
             cJSON_AddStringToObject(root, "status", "connected");
             char* json_str = cJSON_PrintUnformatted(root);
 
-            self->eventCallback(CONNECT_SUCCESS, json_str);
+            self->notifySessionEvent(CONNECT_SUCCESS, json_str);
 
             cJSON_Delete(root);
             switch_safe_free(json_str);
@@ -193,7 +221,7 @@ private:
 
             char* json_str = cJSON_PrintUnformatted(root);
 
-            self->eventCallback(CONNECT_ERROR, json_str);
+            self->notifySessionEvent(CONNECT_ERROR, json_str);
 
             cJSON_Delete(root);
             switch_safe_free(json_str);
@@ -213,7 +241,7 @@ private:
 
             char* json_str = cJSON_PrintUnformatted(root);
 
-            self->eventCallback(CONNECTION_DROPPED, json_str);
+            self->notifySessionEvent(CONNECTION_DROPPED, json_str);
 
             cJSON_Delete(root);
             switch_safe_free(json_str);
@@ -250,25 +278,97 @@ private:
         }
     }
 
-    void eventCallback(notifyEvent_t event, const char* message) {
-        std::string msg = message ? message : "";
-
-        // processing without holding a session
-        ProcessResult pr;
-        if (event == MESSAGE) {
-            pr = processMessage(msg);
-            if (pr.ok == SWITCH_TRUE) {
-                msg = pr.rewrittenJsonData; // overwrite only on success
-            }
+    void enqueueText(const std::string& message) {
+        {
+            std::lock_guard<std::mutex> lock(m_inboundMutex);
+            m_inboundQueue.push_back(InboundMessage{InboundMessageType::Text, message, {}});
         }
+        m_inboundCond.notify_one();
+    }
+
+    void enqueueBinary(const void* data, size_t len) {
+        if (!data || !len) {
+            return;
+        }
+
+        InboundMessage message;
+        message.type = InboundMessageType::Binary;
+        message.binary.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + len);
+
+        {
+            std::lock_guard<std::mutex> lock(m_inboundMutex);
+            m_inboundQueue.push_back(std::move(message));
+        }
+        m_inboundCond.notify_one();
+    }
+
+    void stopInboundWorker() {
+        {
+            std::lock_guard<std::mutex> lock(m_inboundMutex);
+            m_stopInboundWorker = true;
+            m_inboundQueue.clear();
+        }
+        m_inboundCond.notify_all();
+
+        if (m_inboundWorker.joinable()) {
+            m_inboundWorker.join();
+        }
+    }
+
+    private_t *get_private_data(switch_core_session_t *session) {
+        auto *bug = get_media_bug(session);
+        if (!bug) {
+            return nullptr;
+        }
+
+        return static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
+    }
+
+    void processInboundQueue() {
+        while (true) {
+            InboundMessage message;
+
+            {
+                std::unique_lock<std::mutex> lock(m_inboundMutex);
+                m_inboundCond.wait(lock, [this]() {
+                    return m_stopInboundWorker || !m_inboundQueue.empty();
+                });
+
+                if (m_stopInboundWorker && m_inboundQueue.empty()) {
+                    return;
+                }
+
+                message = std::move(m_inboundQueue.front());
+                m_inboundQueue.pop_front();
+            }
+
+            switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+            if (!psession) {
+                continue;
+            }
+
+            auto *tech_pvt = get_private_data(psession);
+            if (!tech_pvt) {
+                switch_core_session_rwunlock(psession);
+                continue;
+            }
+
+            if (message.type == InboundMessageType::Text) {
+                processQueuedText(psession, tech_pvt, message.text);
+            } else {
+                processQueuedBinary(psession, tech_pvt, message.binary);
+            }
+
+            switch_core_session_rwunlock(psession);
+        }
+    }
+
+    void notifySessionEvent(notifyEvent_t event, const char* message) {
+        std::string msg = message ? message : "";
 
         switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
         if (!psession) {
             return;
-        }
-
-        for (const auto& e : pr.errors) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_ERROR, "%s\n", e.c_str());
         }
 
         switch (event) {
@@ -289,21 +389,168 @@ private:
                 break;
 
             case MESSAGE:
-                if (pr.ok == SWITCH_TRUE) {
-                    m_notify(psession, EVENT_PLAY, msg.c_str());
-                } else {
-                    // fall back to EVENT_JSON
-                    m_notify(psession, EVENT_JSON, msg.c_str());
-                }
-
-                if (!m_suppress_log) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
-                                    "response: %s\n", msg.c_str());
-                }
                 break;
         }
 
         switch_core_session_rwunlock(psession);
+    }
+
+    uint32_t get_uint_field(cJSON* root, cJSON* data, const char* field_name, uint32_t fallback = 0) {
+        cJSON* item = cJSON_GetObjectItem(root, field_name);
+        if (!cJSON_IsNumber(item) && data) {
+            item = cJSON_GetObjectItem(data, field_name);
+        }
+
+        if (!cJSON_IsNumber(item) || item->valueint <= 0) {
+            return fallback;
+        }
+
+        return static_cast<uint32_t>(item->valueint);
+    }
+
+    const char* get_string_field(cJSON* root, cJSON* data, const char* field_name) {
+        const char* value = cJSON_GetObjectCstr(root, field_name);
+        if (!value && data) {
+            value = cJSON_GetObjectCstr(data, field_name);
+        }
+        return value;
+    }
+
+    bool handleControlMessage(switch_core_session_t *session, private_t *tech_pvt, const std::string& message) {
+        using jsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
+        jsonPtr root(cJSON_Parse(message.c_str()), &cJSON_Delete);
+        if (!root) {
+            return false;
+        }
+
+        const char* json_type = cJSON_GetObjectCstr(root.get(), "type");
+        if (!json_type) {
+            return false;
+        }
+
+        cJSON* json_data = cJSON_GetObjectItem(root.get(), "data");
+
+        if (std::strcmp(json_type, "streamAudioBegin") == 0) {
+            const char* format = get_string_field(root.get(), json_data, "format");
+            const char* audio_data_type = get_string_field(root.get(), json_data, "audioDataType");
+            const char* encoding = get_string_field(root.get(), json_data, "encoding");
+            const uint32_t sample_rate = get_uint_field(root.get(), json_data, "rate", get_uint_field(root.get(), json_data, "sampleRate"));
+            const uint32_t channels = get_uint_field(root.get(), json_data, "channels", 1);
+
+            const bool format_ok = (format && std::strcmp(format, "pcm16") == 0) ||
+                                   (audio_data_type && std::strcmp(audio_data_type, "raw") == 0) ||
+                                   (encoding && std::strcmp(encoding, "pcm_s16le") == 0);
+
+            if (!format_ok || !sample_rate || channels != 1) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_ERROR,
+                    "(%s) unsupported inbound playback format rate=%u channels=%u format=%s audioDataType=%s encoding=%s\n",
+                    tech_pvt->sessionId,
+                    sample_rate,
+                    channels,
+                    format ? format : "",
+                    audio_data_type ? audio_data_type : "",
+                    encoding ? encoding : ""
+                );
+                return true;
+            }
+
+            if (inbound_playback_start(session, tech_pvt, sample_rate, channels) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_ERROR,
+                    "(%s) failed to start inbound playback stream\n",
+                    tech_pvt->sessionId
+                );
+            }
+            else {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) accepted streamAudioBegin rate=%u channels=%u format=%s audioDataType=%s encoding=%s\n",
+                    tech_pvt->sessionId,
+                    sample_rate,
+                    channels,
+                    format ? format : "",
+                    audio_data_type ? audio_data_type : "",
+                    encoding ? encoding : ""
+                );
+            }
+
+            return true;
+        }
+
+        if (std::strcmp(json_type, "streamAudioEnd") == 0) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) received streamAudioEnd\n",
+                tech_pvt->sessionId
+            );
+            inbound_playback_end(tech_pvt);
+            return true;
+        }
+
+        if (std::strcmp(json_type, "cancel_tts") == 0) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) received cancel_tts\n",
+                tech_pvt->sessionId
+            );
+            inbound_playback_cancel(session, tech_pvt);
+            return true;
+        }
+
+        return false;
+    }
+
+    void processQueuedText(switch_core_session_t *session, private_t *tech_pvt, const std::string& message) {
+        if (handleControlMessage(session, tech_pvt, message)) {
+            if (!m_suppress_log) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "response: %s\n", message.c_str());
+            }
+            return;
+        }
+
+        ProcessResult pr = processMessage(message);
+        for (const auto& e : pr.errors) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s\n", e.c_str());
+        }
+
+        const std::string& payload = pr.ok == SWITCH_TRUE ? pr.rewrittenJsonData : message;
+        m_notify(session, pr.ok == SWITCH_TRUE ? EVENT_PLAY : EVENT_JSON, payload.c_str());
+
+        if (!m_suppress_log) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "response: %s\n", payload.c_str());
+        }
+    }
+
+    void processQueuedBinary(switch_core_session_t *session, private_t *tech_pvt, const std::vector<uint8_t>& payload) {
+        if (payload.empty()) {
+            return;
+        }
+
+        if (switch_channel_var_true(switch_core_session_get_channel(session), "STREAM_LIVE_PLAYBACK_DEBUG")) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_DEBUG,
+                "(%s) received binary playback payload bytes=%" SWITCH_SIZE_T_FMT "\n",
+                tech_pvt->sessionId,
+                static_cast<switch_size_t>(payload.size())
+            );
+        }
+
+        if (inbound_playback_append(tech_pvt, payload.data(), payload.size()) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_WARNING,
+                "(%s) dropping inbound binary playback payload of %" SWITCH_SIZE_T_FMT " bytes\n",
+                tech_pvt->sessionId,
+                static_cast<switch_size_t>(payload.size())
+            );
+        }
     }
 
 
@@ -437,6 +684,11 @@ private:
     std::unordered_set<std::string> m_Files;
     std::atomic<bool> m_cleanedUp{false};
     std::mutex m_stateMutex;
+    std::mutex m_inboundMutex;
+    std::condition_variable m_inboundCond;
+    std::deque<InboundMessage> m_inboundQueue;
+    std::thread m_inboundWorker;
+    bool m_stopInboundWorker = false;
 };
 
 
@@ -464,16 +716,10 @@ namespace {
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
+        switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
+
         //size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
         const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
-        
-        auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
-                                        suppressLog, extra_headers, tls_cafile, tls_keyfile,
-                                        tls_certfile, tls_disable_hostname_validation);
-
-        tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
-
-        switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
         
         if (switch_buffer_create(pool, &tech_pvt->sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -493,6 +739,17 @@ namespace {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) no resampling needed for this call\n", tech_pvt->sessionId);
         }
 
+        if (inbound_playback_session_init(session, tech_pvt) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) failed to initialize inbound playback state\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
+                                        suppressLog, extra_headers, tls_cafile, tls_keyfile,
+                                        tls_certfile, tls_disable_hostname_validation);
+
+        tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
+
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init\n", tech_pvt->sessionId);
 
         return SWITCH_STATUS_SUCCESS;
@@ -504,6 +761,7 @@ namespace {
             speex_resampler_destroy(tech_pvt->resampler);
             tech_pvt->resampler = nullptr;
         }
+        tech_pvt->pInboundPlayback = nullptr;
         if (tech_pvt->mutex) {
             switch_mutex_destroy(tech_pvt->mutex);
             tech_pvt->mutex = nullptr;
@@ -916,6 +1174,7 @@ extern "C" {
                 streamer->disconnect();
             }
 
+            inbound_playback_session_cleanup(session, tech_pvt);
             destroy_tech_pvt(tech_pvt);
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);

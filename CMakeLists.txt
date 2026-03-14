@@ -30,6 +30,8 @@ add_library(mod_audio_stream SHARED
     mod_audio_stream.h
     audio_streamer_glue.h
     audio_streamer_glue.cpp
+    inbound_playback.h
+    inbound_playback.cpp
     base64.cpp
 )
 
