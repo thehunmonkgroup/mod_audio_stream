@@ -416,6 +416,22 @@ private:
         return value;
     }
 
+    void emitControlEvent(
+        switch_core_session_t *session,
+        private_t *tech_pvt,
+        const char* event_name,
+        const std::string& message
+    ) {
+        if (!tech_pvt || !tech_pvt->responseHandler || !event_name) {
+            return;
+        }
+        tech_pvt->responseHandler(
+            session,
+            event_name,
+            message.empty() ? nullptr : message.c_str()
+        );
+    }
+
     bool handleControlMessage(switch_core_session_t *session, private_t *tech_pvt, const std::string& message) {
         using jsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
         jsonPtr root(cJSON_Parse(message.c_str()), &cJSON_Delete);
@@ -478,6 +494,7 @@ private:
                 );
             }
 
+            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_BEGIN, message);
             return true;
         }
 
@@ -489,17 +506,19 @@ private:
                 tech_pvt->sessionId
             );
             inbound_playback_end(tech_pvt);
+            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_END, message);
             return true;
         }
 
-        if (std::strcmp(json_type, "cancel_tts") == 0) {
+        if (std::strcmp(json_type, "streamAudioCancel") == 0) {
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(session),
                 SWITCH_LOG_DEBUG,
-                "(%s) received cancel_tts\n",
+                "(%s) received streamAudioCancel\n",
                 tech_pvt->sessionId
             );
             inbound_playback_cancel(session, tech_pvt);
+            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_CANCEL, message);
             return true;
         }
 

@@ -175,6 +175,9 @@ Module will generate the following event types:
 - `mod_audio_stream::disconnect`
 - `mod_audio_stream::error`
 - `mod_audio_stream::play`
+- `mod_audio_stream::stream_audio_begin`
+- `mod_audio_stream::stream_audio_end`
+- `mod_audio_stream::stream_audio_cancel`
 
 ### response
 Message received from websocket endpoint. Json expected, but it contains whatever the websocket server's response is.
@@ -297,9 +300,9 @@ Then send websocket binary frames containing raw `pcm_s16le` audio. End the live
 To interrupt active live playback immediately, send:
 ```json
 {
-  "type": "cancel_tts"
+  "type": "streamAudioCancel"
 }
 ```
 This is a websocket control message from the remote service to `mod_audio_stream`, not a FreeSWITCH API command.
 
-Live binary playback is normalized into the channel's native playback format, buffered in memory, and written back to the channel on the module's internal playout clock. `streamAudioEnd` marks the current playback stream as draining; any binary frames that arrive before the next `streamAudioBegin` are still accepted and drained. To cut playback immediately from FreeSWITCH, call `uuid_audio_stream <uuid> playback_stop`. Remote services can also interrupt playback by sending the websocket `cancel_tts` control message shown above.
+Live binary playback is normalized into the channel's native playback format, buffered in memory, and written back to the channel on the module's internal playout clock. `streamAudioEnd` marks the current playback stream as draining; any binary frames that arrive before the next `streamAudioBegin` are still accepted and drained. To cut playback immediately from FreeSWITCH, call `uuid_audio_stream <uuid> playback_stop`. Remote services can also interrupt playback by sending the websocket `streamAudioCancel` control message shown above.
