@@ -89,6 +89,7 @@ The following channel variables can be used to fine tune websocket connection an
 | STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
 | STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
 | STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
+| STREAM_OUTBOUND_DEBUG                  | enable verbose outbound audio diagnostics               | off     |
 | STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS     | bounded live playback buffer for inbound binary audio   | 500     |
 | STREAM_LIVE_PLAYBACK_PREROLL_MS        | preroll before live playback starts                     | 60      |
 | STREAM_LIVE_PLAYBACK_DEBUG             | enable verbose live playback diagnostics                | off     |
@@ -114,6 +115,7 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
   - libwsc does not support automatic reconnection.
 - `STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS` bounds the in-memory buffer used for live inbound binary PCM playback. When the buffer fills, the oldest audio is dropped to keep latency bounded.
 - `STREAM_LIVE_PLAYBACK_PREROLL_MS` controls how much buffered audio is accumulated before live inbound playback starts.
+- `STREAM_OUTBOUND_DEBUG` enables detailed outbound mic-stream diagnostics, including websocket write sizes and buffer flush totals.
 - `STREAM_LIVE_PLAYBACK_DEBUG` enables detailed logs for live inbound playback: stream start, binary append checkpoints, file open/read/EOF, zero-fill underruns, and cleanup counters.
 - TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
   - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.

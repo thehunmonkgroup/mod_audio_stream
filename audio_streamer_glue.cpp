@@ -23,12 +23,12 @@ public:
     // Factory
     static std::shared_ptr<AudioStreamer> create(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
-        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
+        bool suppressLog, bool outboundDebug, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
         const char* tls_certfile, bool tls_disable_hostname_validation) {
 
         std::shared_ptr<AudioStreamer> sp(new AudioStreamer(
             uuid, wsUri, callback, deflate, heart_beat,
-            suppressLog, extra_headers, tls_cafile, tls_keyfile, 
+            suppressLog, outboundDebug, extra_headers, tls_cafile, tls_keyfile, 
             tls_certfile, tls_disable_hostname_validation
         ));
 
@@ -53,7 +53,18 @@ public:
     }
 
     void writeBinary(uint8_t* buffer, size_t len) {
-        if(!this->isConnected()) return;
+        const bool connected = this->isConnected();
+        if (m_outbound_debug) {
+            switch_log_printf(
+                SWITCH_CHANNEL_LOG,
+                SWITCH_LOG_DEBUG,
+                "(%s) websocket_write_binary bytes=%" SWITCH_SIZE_T_FMT " connected=%s\n",
+                m_sessionId.c_str(),
+                static_cast<switch_size_t>(len),
+                connected ? "true" : "false"
+            );
+        }
+        if(!connected) return;
         client.sendBinary(buffer, len);
     }
 
@@ -98,10 +109,10 @@ private:
     // Ctor
     AudioStreamer(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
-        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
+        bool suppressLog, bool outboundDebug, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
         const char* tls_certfile, bool tls_disable_hostname_validation
     ) : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), 
-        m_extra_headers(extra_headers), m_playFile(0) {
+        m_outbound_debug(outboundDebug), m_extra_headers(extra_headers), m_playFile(0) {
 
         WebSocketHeaders hdrs;
         WebSocketTLSOptions tls;
@@ -698,6 +709,7 @@ private:
     responseHandler_t m_notify;
     WebSocketClient client;
     bool m_suppress_log;
+    bool m_outbound_debug;
     const char* m_extra_headers;
     int m_playFile;
     std::unordered_set<std::string> m_Files;
@@ -732,6 +744,10 @@ namespace {
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
         tech_pvt->audio_paused = 0;
+        tech_pvt->outbound_debug = switch_channel_var_true(
+            switch_core_session_get_channel(session),
+            "STREAM_OUTBOUND_DEBUG"
+        );
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
@@ -764,7 +780,7 @@ namespace {
         }
 
         auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
-                                        suppressLog, extra_headers, tls_cafile, tls_keyfile,
+                                        suppressLog, tech_pvt->outbound_debug, extra_headers, tls_cafile, tls_keyfile,
                                         tls_certfile, tls_disable_hostname_validation);
 
         tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
@@ -997,22 +1013,58 @@ extern "C" {
     switch_bool_t stream_frame(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) return SWITCH_TRUE;
-        if (tech_pvt->audio_paused || tech_pvt->cleanup_started) return SWITCH_TRUE;
+        if (tech_pvt->audio_paused || tech_pvt->cleanup_started) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip paused=%d cleanup_started=%d\n",
+                    tech_pvt->sessionId,
+                    tech_pvt->audio_paused,
+                    tech_pvt->cleanup_started
+                );
+            }
+            return SWITCH_TRUE;
+        }
         
         std::shared_ptr<AudioStreamer> streamer;
         std::vector<std::vector<uint8_t>> pending_send;
 
         if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip reason=mutex_busy\n",
+                    tech_pvt->sessionId
+                );
+            }
             return SWITCH_TRUE;
         }
 
         if (!tech_pvt->pAudioStreamer) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip reason=no_streamer\n",
+                    tech_pvt->sessionId
+                );
+            }
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
 
         auto sp_ptr = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
         if (!sp_ptr || !(*sp_ptr)) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip reason=streamer_unavailable\n",
+                    tech_pvt->sessionId
+                );
+            }
             switch_mutex_unlock(tech_pvt->mutex);
             return SWITCH_TRUE;
         }
@@ -1022,6 +1074,21 @@ extern "C" {
         auto *resampler = tech_pvt->resampler;
         const int channels = tech_pvt->channels;
         const int rtp_packets = tech_pvt->rtp_packets;
+        if (tech_pvt->outbound_debug) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                SWITCH_LOG_DEBUG,
+                "(%s) stream_frame_enter connected=%s resampler=%s channels=%d rtp_packets=%d\n",
+                tech_pvt->sessionId,
+                streamer && streamer->isConnected() ? "true" : "false",
+                resampler ? "true" : "false",
+                channels,
+                rtp_packets
+            );
+        }
+
+        switch_size_t frames_read = 0;
+        switch_size_t bytes_captured = 0;
 
         if (nullptr == resampler) {
             
@@ -1034,6 +1101,8 @@ extern "C" {
                 if (!frame.datalen) {
                     continue;
                 }
+                frames_read += 1;
+                bytes_captured += static_cast<switch_size_t>(frame.datalen);
 
                 if (rtp_packets == 1) {
                     pending_send.emplace_back((uint8_t*)frame.data, (uint8_t*)frame.data + frame.datalen);
@@ -1068,6 +1137,7 @@ extern "C" {
                 if(!frame.datalen) {
                     continue;
                 }
+                frames_read += 1;
 
                 const size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
                 spx_uint32_t in_len = frame.samples;
@@ -1106,6 +1176,7 @@ extern "C" {
 
                 if(out_len > 0) {
                     const size_t bytes_written = (size_t)out_len * (size_t)channels * sizeof(spx_int16_t);
+                    bytes_captured += static_cast<switch_size_t>(bytes_written);
 
                     if (rtp_packets == 1) { //20ms packet
                         const uint8_t* p = (const uint8_t*)out.data();
@@ -1131,13 +1202,47 @@ extern "C" {
         }
         
         switch_mutex_unlock(tech_pvt->mutex);
+        if (tech_pvt->outbound_debug) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                SWITCH_LOG_DEBUG,
+                "(%s) stream_frame_capture_result frames=%" SWITCH_SIZE_T_FMT " captured_bytes=%" SWITCH_SIZE_T_FMT " queued_chunks=%" SWITCH_SIZE_T_FMT "\n",
+                tech_pvt->sessionId,
+                frames_read,
+                bytes_captured,
+                static_cast<switch_size_t>(pending_send.size())
+            );
+        }
     
-        if (!streamer || !streamer->isConnected()) return SWITCH_TRUE;
+        if (!streamer || !streamer->isConnected()) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip reason=not_connected queued_chunks=%" SWITCH_SIZE_T_FMT "\n",
+                    tech_pvt->sessionId,
+                    static_cast<switch_size_t>(pending_send.size())
+                );
+            }
+            return SWITCH_TRUE;
+        }
 
+        switch_size_t total_bytes = 0;
         for (auto &chunk : pending_send) {
             if (!chunk.empty()) {
+                total_bytes += static_cast<switch_size_t>(chunk.size());
                 streamer->writeBinary(chunk.data(), chunk.size());
             }
+        }
+        if (tech_pvt->outbound_debug && !pending_send.empty()) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                SWITCH_LOG_DEBUG,
+                "(%s) websocket_audio_flush chunks=%" SWITCH_SIZE_T_FMT " bytes=%" SWITCH_SIZE_T_FMT "\n",
+                tech_pvt->sessionId,
+                static_cast<switch_size_t>(pending_send.size()),
+                total_bytes
+            );
         }
 
         return SWITCH_TRUE;

@@ -33,6 +33,7 @@ struct private_data {
     int audio_paused:1;
     int close_requested:1;
     int cleanup_started:1;
+    int outbound_debug:1;
     char initialMetadata[8192];
     switch_buffer_t *sbuffer;
     int rtp_packets;

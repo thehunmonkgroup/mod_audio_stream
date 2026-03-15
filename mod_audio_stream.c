@@ -40,6 +40,17 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             break;
 
         case SWITCH_ABC_TYPE_READ:
+            if (tech_pvt && tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) capture_callback type=READ close_requested=%d paused=%d cleanup_started=%d\n",
+                    tech_pvt->sessionId,
+                    tech_pvt->close_requested,
+                    tech_pvt->audio_paused,
+                    tech_pvt->cleanup_started
+                );
+            }
             if (tech_pvt->close_requested) {
                 return SWITCH_FALSE;
             }
