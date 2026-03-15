@@ -164,7 +164,7 @@ static switch_status_t do_playback_stop(switch_core_session_t *session) {
     }
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_stop\n");
-    status = inbound_playback_cancel(session, tech_pvt);
+    status = inbound_playback_cancel(session, tech_pvt, NULL, 0);
     return status;
 }
 
@@ -297,7 +297,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
         switch_event_reserve_subclass(EVENT_PLAY) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_STREAM_AUDIO_BEGIN) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_STREAM_AUDIO_END) != SWITCH_STATUS_SUCCESS ||
-        switch_event_reserve_subclass(EVENT_STREAM_AUDIO_CANCEL) != SWITCH_STATUS_SUCCESS) {
+        switch_event_reserve_subclass(EVENT_STREAM_AUDIO_CANCEL) != SWITCH_STATUS_SUCCESS ||
+        switch_event_reserve_subclass(EVENT_STREAM_AUDIO_PLAYBACK_START) != SWITCH_STATUS_SUCCESS ||
+        switch_event_reserve_subclass(EVENT_STREAM_AUDIO_PLAYBACK_COMPLETE) != SWITCH_STATUS_SUCCESS ||
+        switch_event_reserve_subclass(EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_stream API.\n");
         return SWITCH_STATUS_TERM;
     }
@@ -330,6 +333,9 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown)
     switch_event_free_subclass(EVENT_STREAM_AUDIO_BEGIN);
     switch_event_free_subclass(EVENT_STREAM_AUDIO_END);
     switch_event_free_subclass(EVENT_STREAM_AUDIO_CANCEL);
+    switch_event_free_subclass(EVENT_STREAM_AUDIO_PLAYBACK_START);
+    switch_event_free_subclass(EVENT_STREAM_AUDIO_PLAYBACK_COMPLETE);
+    switch_event_free_subclass(EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED);
 
     return SWITCH_STATUS_SUCCESS;
 }

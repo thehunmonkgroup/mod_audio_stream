@@ -14,10 +14,22 @@ switch_status_t inbound_playback_start(
     switch_core_session_t *session,
     private_t *tech_pvt,
     uint32_t source_rate,
-    uint32_t source_channels
+    uint32_t source_channels,
+    const char *requested_playback_id,
+    char *resolved_playback_id,
+    size_t resolved_playback_id_len
 );
-switch_status_t inbound_playback_end(private_t *tech_pvt);
-switch_status_t inbound_playback_cancel(switch_core_session_t *session, private_t *tech_pvt);
+switch_status_t inbound_playback_end(
+    private_t *tech_pvt,
+    char *playback_id,
+    size_t playback_id_len
+);
+switch_status_t inbound_playback_cancel(
+    switch_core_session_t *session,
+    private_t *tech_pvt,
+    char *playback_id,
+    size_t playback_id_len
+);
 switch_status_t inbound_playback_append(private_t *tech_pvt, const void *data, size_t len);
 switch_status_t inbound_playback_tick(switch_core_session_t *session, private_t *tech_pvt);
 

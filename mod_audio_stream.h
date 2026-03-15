@@ -17,6 +17,9 @@
 #define EVENT_STREAM_AUDIO_BEGIN "mod_audio_stream::stream_audio_begin"
 #define EVENT_STREAM_AUDIO_END   "mod_audio_stream::stream_audio_end"
 #define EVENT_STREAM_AUDIO_CANCEL "mod_audio_stream::stream_audio_cancel"
+#define EVENT_STREAM_AUDIO_PLAYBACK_START "mod_audio_stream::stream_audio_playback_start"
+#define EVENT_STREAM_AUDIO_PLAYBACK_COMPLETE "mod_audio_stream::stream_audio_playback_complete"
+#define EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED "mod_audio_stream::stream_audio_playback_cancelled"
 
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char* eventName, const char* json);
 

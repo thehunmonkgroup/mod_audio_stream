@@ -443,6 +443,51 @@ private:
         );
     }
 
+    std::string buildControlEventPayload(
+        const char* event_type,
+        const char* playback_id,
+        const char* format = nullptr,
+        uint32_t sample_rate = 0,
+        uint32_t channels = 0,
+        const char* audio_data_type = nullptr,
+        const char* encoding = nullptr
+    ) {
+        if (!event_type) {
+            return {};
+        }
+
+        cJSON* root = cJSON_CreateObject();
+        if (!root) {
+            return {};
+        }
+
+        cJSON_AddStringToObject(root, "type", event_type);
+        if (playback_id && playback_id[0] != '\0') {
+            cJSON_AddStringToObject(root, "playbackId", playback_id);
+        }
+        if (format && format[0] != '\0') {
+            cJSON_AddStringToObject(root, "format", format);
+        }
+        if (sample_rate > 0) {
+            cJSON_AddNumberToObject(root, "rate", sample_rate);
+        }
+        if (channels > 0) {
+            cJSON_AddNumberToObject(root, "channels", channels);
+        }
+        if (audio_data_type && audio_data_type[0] != '\0') {
+            cJSON_AddStringToObject(root, "audioDataType", audio_data_type);
+        }
+        if (encoding && encoding[0] != '\0') {
+            cJSON_AddStringToObject(root, "encoding", encoding);
+        }
+
+        char* json = cJSON_PrintUnformatted(root);
+        std::string payload = json ? json : "";
+        cJSON_Delete(root);
+        switch_safe_free(json);
+        return payload;
+    }
+
     bool handleControlMessage(switch_core_session_t *session, private_t *tech_pvt, const std::string& message) {
         using jsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
         jsonPtr root(cJSON_Parse(message.c_str()), &cJSON_Delete);
@@ -461,8 +506,10 @@ private:
             const char* format = get_string_field(root.get(), json_data, "format");
             const char* audio_data_type = get_string_field(root.get(), json_data, "audioDataType");
             const char* encoding = get_string_field(root.get(), json_data, "encoding");
+            const char* requested_playback_id = get_string_field(root.get(), json_data, "playbackId");
             const uint32_t sample_rate = get_uint_field(root.get(), json_data, "rate", get_uint_field(root.get(), json_data, "sampleRate"));
             const uint32_t channels = get_uint_field(root.get(), json_data, "channels", 1);
+            char resolved_playback_id[512] = "";
 
             const bool format_ok = (format && std::strcmp(format, "pcm16") == 0) ||
                                    (audio_data_type && std::strcmp(audio_data_type, "raw") == 0) ||
@@ -483,7 +530,17 @@ private:
                 return true;
             }
 
-            if (inbound_playback_start(session, tech_pvt, sample_rate, channels) != SWITCH_STATUS_SUCCESS) {
+            if (
+                inbound_playback_start(
+                    session,
+                    tech_pvt,
+                    sample_rate,
+                    channels,
+                    requested_playback_id,
+                    resolved_playback_id,
+                    sizeof(resolved_playback_id)
+                ) != SWITCH_STATUS_SUCCESS
+            ) {
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
                     SWITCH_LOG_ERROR,
@@ -505,31 +562,56 @@ private:
                 );
             }
 
-            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_BEGIN, message);
+            emitControlEvent(
+                session,
+                tech_pvt,
+                EVENT_STREAM_AUDIO_BEGIN,
+                buildControlEventPayload(
+                    "streamAudioBegin",
+                    resolved_playback_id,
+                    format,
+                    sample_rate,
+                    channels,
+                    audio_data_type,
+                    encoding
+                )
+            );
             return true;
         }
 
         if (std::strcmp(json_type, "streamAudioEnd") == 0) {
+            char playback_id[512] = "";
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(session),
                 SWITCH_LOG_DEBUG,
                 "(%s) received streamAudioEnd\n",
                 tech_pvt->sessionId
             );
-            inbound_playback_end(tech_pvt);
-            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_END, message);
+            inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id));
+            emitControlEvent(
+                session,
+                tech_pvt,
+                EVENT_STREAM_AUDIO_END,
+                buildControlEventPayload("streamAudioEnd", playback_id)
+            );
             return true;
         }
 
         if (std::strcmp(json_type, "streamAudioCancel") == 0) {
+            char playback_id[512] = "";
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(session),
                 SWITCH_LOG_DEBUG,
                 "(%s) received streamAudioCancel\n",
                 tech_pvt->sessionId
             );
-            inbound_playback_cancel(session, tech_pvt);
-            emitControlEvent(session, tech_pvt, EVENT_STREAM_AUDIO_CANCEL, message);
+            inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id));
+            emitControlEvent(
+                session,
+                tech_pvt,
+                EVENT_STREAM_AUDIO_CANCEL,
+                buildControlEventPayload("streamAudioCancel", playback_id)
+            );
             return true;
         }
 
