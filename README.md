@@ -33,11 +33,13 @@ sudo make install
 **TLS** is `OFF` by default. To build with TLS support add `-DUSE_TLS=ON` to cmake line.
 
 #### DEB Package
-To build DEB package after making the module:
+To build a DEB package after making the module:
 ```
 cpack -G DEB
 ```
 Debian package will be placed in root directory `_packages` folder.
+The default DEB package targets distro-installed FreeSWITCH and lets Debian tooling derive shared-library dependencies automatically.
+If FreeSWITCH was built from source and installed locally, add `-DMOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH=ON` to the cmake line. The local variant does not declare a Debian package dependency for FreeSWITCH, so the target system must already provide `libfreeswitch.so.1` through an existing FreeSWITCH installation and runtime linker configuration.
 
 ## Scripted Build & Installation
 

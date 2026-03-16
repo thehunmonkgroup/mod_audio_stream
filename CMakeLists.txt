@@ -14,6 +14,11 @@ option(ENABLE_LOCAL "Enable local compile/debug specific" OFF)
 if(ENABLE_LOCAL)
     set(ENV{PKG_CONFIG_PATH} "/usr/local/freeswitch/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 endif()
+
+option(MOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH
+    "Build DEB for source-built/local FreeSWITCH instead of distro-packaged FreeSWITCH"
+    OFF)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(PkgConfig REQUIRED)
@@ -50,7 +55,28 @@ if(CMAKE_BUILD_TYPE MATCHES "Release")
 endif()
 
 set(CPACK_COMPONENTS_ALL ${PROJECT_NAME} changelog.gz copyright)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6, libspeexdsp1, openssl, zlib1g, libfreeswitch1")
+
+if(MOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
+    # Local FreeSWITCH installs do not map libfreeswitch.so.1 to a Debian package.
+    set(_deb_depends
+        libc6
+        libstdc++6
+        libspeexdsp1
+        zlib1g
+        libevent-2.1-7
+    )
+
+    if(USE_TLS)
+        list(APPEND _deb_depends libssl3)
+    endif()
+
+    list(JOIN _deb_depends ", " CPACK_DEBIAN_PACKAGE_DEPENDS)
+else()
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    unset(CPACK_DEBIAN_PACKAGE_DEPENDS)
+endif()
+
 set(CPACK_PACKAGE_NAME "mod-audio-stream")
 set(CMAKE_INSTALL_DOCDIR "share/doc/${CPACK_PACKAGE_NAME}")
 
