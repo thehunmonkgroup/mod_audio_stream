@@ -12,9 +12,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load);
 SWITCH_MODULE_DEFINITION(mod_audio_stream, mod_audio_stream_load, mod_audio_stream_shutdown, NULL /*mod_audio_stream_runtime*/);
 
 static void responseHandler(switch_core_session_t* session, const char* eventName, const char* json) {
-    switch_event_t *event;
+    switch_event_t *event = NULL;
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, eventName);
+    if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, eventName) != SWITCH_STATUS_SUCCESS || !event) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: failed to create event %s\n", eventName ? eventName : "(null)");
+        return;
+    }
     switch_channel_event_set_data(channel, event);
     if (json) switch_event_add_body(event, "%s", json);
     switch_event_fire(&event);
@@ -34,7 +37,7 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
                 // Check if this is a normal channel closure or a requested closure
-                channel_closing = tech_pvt->close_requested ? 0 : 1;
+                channel_closing = switch_atomic_read(&tech_pvt->close_requested) ? 0 : 1;
                 stream_session_cleanup(session, NULL, channel_closing);
             }
             break;
@@ -46,12 +49,12 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
                     SWITCH_LOG_DEBUG,
                     "(%s) capture_callback type=READ close_requested=%d paused=%d cleanup_started=%d\n",
                     tech_pvt->sessionId,
-                    tech_pvt->close_requested,
-                    tech_pvt->audio_paused,
-                    tech_pvt->cleanup_started
+                    switch_atomic_read(&tech_pvt->close_requested),
+                    switch_atomic_read(&tech_pvt->audio_paused),
+                    switch_atomic_read(&tech_pvt->cleanup_started)
                 );
             }
-            if (tech_pvt->close_requested) {
+            if (switch_atomic_read(&tech_pvt->close_requested)) {
                 return SWITCH_FALSE;
             }
             return stream_frame(bug);
@@ -102,6 +105,11 @@ static switch_status_t start_capture(switch_core_session_t *session,
     }
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");
     switch_channel_set_private(channel, MY_BUG_NAME, bug);
+    {
+        private_t *tech_pvt = (private_t *)pUserData;
+        switch_atomic_set(&tech_pvt->active_stream_counted, 1);
+        stream_session_active_inc();
+    }
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "exiting start_capture.\n");
     return SWITCH_STATUS_SUCCESS;
@@ -112,7 +120,7 @@ static switch_status_t do_stop(switch_core_session_t *session, char* text)
     switch_status_t status = SWITCH_STATUS_SUCCESS;
 
     if (text) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: stop w/ final text %s\n", text);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: stop w/ final text len=%" SWITCH_SIZE_T_FMT "\n", (switch_size_t)strlen(text));
     }
     else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: stop\n");
@@ -138,11 +146,11 @@ static switch_status_t send_text(switch_core_session_t *session, char* text) {
     switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
 
     if (bug) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: sending text: %s.\n", text);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: sending text len=%" SWITCH_SIZE_T_FMT ".\n", (switch_size_t)strlen(text));
         status = stream_session_send_text(session, text);
     }
     else {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed sending text: %s.\n", text);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed sending text len=%" SWITCH_SIZE_T_FMT ".\n", (switch_size_t)strlen(text));
     }
     return status;
 }
@@ -168,7 +176,7 @@ static switch_status_t do_playback_stop(switch_core_session_t *session) {
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | playback_stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+#define STREAM_API_SYNTAX "<uuid> [start | stop | playback_stop | send_text | pause | resume ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -223,9 +231,9 @@ SWITCH_STANDARD_API(stream_function)
                 int sampling = 8000;
                 switch_media_bug_flag_t flags = SMBF_READ_STREAM;
                 char *metadata = argc > 5 ? argv[5] : NULL;
-                if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
+                if(metadata && (is_valid_utf8(metadata) != SWITCH_STATUS_SUCCESS)) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "%s contains invalid utf8 characters\n", argv[2]);
+                                      "metadata contains invalid utf8 characters\n");
                     switch_core_session_rwunlock(lsession);
                     goto done;
                 }
@@ -325,6 +333,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
   Macro expands to: switch_status_t mod_audio_stream_shutdown() */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown)
 {
+    if (stream_session_active_count() > 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_audio_stream: refusing unload with %" SWITCH_SIZE_T_FMT " active streams\n",
+                          (switch_size_t)stream_session_active_count());
+        return SWITCH_STATUS_NOUNLOAD;
+    }
+
     switch_event_free_subclass(EVENT_JSON);
     switch_event_free_subclass(EVENT_CONNECT);
     switch_event_free_subclass(EVENT_DISCONNECT);

@@ -17,6 +17,9 @@ namespace {
 
 constexpr uint32_t kDefaultMaxBufferMs = 5000;
 constexpr uint32_t kDefaultPrerollMs = 60;
+constexpr uint32_t kMinBufferMs = 20;
+constexpr uint32_t kMaxBufferMs = 10000;
+constexpr uint32_t kMaxPrerollMs = 5000;
 
 enum class PlaybackState {
     Idle,
@@ -48,26 +51,38 @@ public:
         return capacity_ - size_;
     }
 
-    size_t write(const uint8_t *data, size_t len) {
+    size_t write(const uint8_t *data, size_t len, size_t *dropped = nullptr) {
         if (!capacity_ || !data || !len) {
             return 0;
         }
 
-        const size_t to_write = std::min(len, writable_size());
-        if (!to_write) {
-            return 0;
+        size_t local_dropped = 0;
+        if (len >= capacity_) {
+            local_dropped += (len - capacity_);
+            data += (len - capacity_);
+            len = capacity_;
+        }
+
+        if (len > writable_size()) {
+            const size_t to_drop = len - writable_size();
+            head_ = (head_ + to_drop) % capacity_;
+            size_ -= to_drop;
+            local_dropped += to_drop;
         }
 
         size_t tail = (head_ + size_) % capacity_;
-        const size_t first = std::min(to_write, capacity_ - tail);
+        const size_t first = std::min(len, capacity_ - tail);
         std::memcpy(buffer_.data() + tail, data, first);
 
-        if (to_write > first) {
-            std::memcpy(buffer_.data(), data + first, to_write - first);
+        if (len > first) {
+            std::memcpy(buffer_.data(), data + first, len - first);
         }
 
-        size_ += to_write;
-        return to_write;
+        size_ += len;
+        if (dropped) {
+            *dropped = local_dropped;
+        }
+        return len;
     }
 
     size_t read(uint8_t *data, size_t len) {
@@ -175,14 +190,15 @@ struct InboundPlaybackState {
     uint64_t dropped_output_bytes = 0;
 };
 
-uint32_t get_channel_var_ms(switch_channel_t *channel, const char *name, uint32_t fallback) {
+uint32_t get_channel_var_ms(switch_channel_t *channel, const char *name, uint32_t fallback, uint32_t min_value, uint32_t max_value) {
     const char *value = switch_channel_get_variable(channel, name);
     if (zstr(value)) {
         return fallback;
     }
 
-    const int parsed = std::atoi(value);
-    if (parsed <= 0) {
+    char *endptr = nullptr;
+    const unsigned long parsed = std::strtoul(value, &endptr, 10);
+    if (!endptr || *endptr != '\0' || parsed < min_value || parsed > max_value) {
         return fallback;
     }
 
@@ -190,7 +206,17 @@ uint32_t get_channel_var_ms(switch_channel_t *channel, const char *name, uint32_
 }
 
 size_t bytes_for_ms(uint32_t rate, uint32_t channels, uint32_t ms) {
-    return static_cast<size_t>(rate) * static_cast<size_t>(channels) * sizeof(int16_t) * static_cast<size_t>(ms) / 1000;
+    const uint64_t total =
+        static_cast<uint64_t>(rate) *
+        static_cast<uint64_t>(channels) *
+        static_cast<uint64_t>(sizeof(int16_t)) *
+        static_cast<uint64_t>(ms);
+
+    if (total == 0) {
+        return 0;
+    }
+
+    return static_cast<size_t>(total / 1000);
 }
 
 const char *playback_state_name(PlaybackState state) {
@@ -592,153 +618,163 @@ void playout_loop(std::shared_ptr<InboundPlaybackState> state) {
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->debug_enabled && !state->thread_started_logged) {
-            state->thread_started_logged = true;
-            switch_log_printf(
-                SWITCH_CHANNEL_LOG,
-                SWITCH_LOG_DEBUG,
-                "(%s) inbound playback thread started target_rate=%u target_channels=%u packet_bytes=%" SWITCH_SIZE_T_FMT "\n",
-                state->session_id.c_str(),
-                state->target_rate,
-                state->target_channels,
-                static_cast<switch_size_t>(state->packet_bytes)
-            );
-        }
-    }
-
-    while (true) {
         {
-            std::unique_lock<std::mutex> lock(state->mutex);
-            state->cond.wait(lock, [&state]() {
-                return state->closed || playback_state_is_active(state->state);
-            });
-
-            if (state->closed) {
-                break;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->debug_enabled && !state->thread_started_logged) {
+                state->thread_started_logged = true;
+                switch_log_printf(
+                    SWITCH_CHANNEL_LOG,
+                    SWITCH_LOG_DEBUG,
+                    "(%s) inbound playback thread started target_rate=%u target_channels=%u packet_bytes=%" SWITCH_SIZE_T_FMT "\n",
+                    state->session_id.c_str(),
+                    state->target_rate,
+                    state->target_channels,
+                    static_cast<switch_size_t>(state->packet_bytes)
+                );
             }
         }
 
-        switch_core_session_t *session = switch_core_session_locate(state->session_id.c_str());
-        if (!session) {
-            switch_log_printf(
-                SWITCH_CHANNEL_LOG,
-                SWITCH_LOG_WARNING,
-                "(%s) inbound playback failed to locate session for active window\n",
-                state->session_id.c_str()
-            );
-            finalize_active_window(state.get());
-            continue;
-        }
-
-        switch_channel_t *channel = switch_core_session_get_channel(session);
-        switch_timer_t timer = {};
-        bool timer_initialized = false;
-        switch_status_t final_status = SWITCH_STATUS_SUCCESS;
-
-        if (switch_core_timer_init(&timer, "soft", static_cast<int>(state->packet_ms), static_cast<int>(state->packet_samples), NULL) != SWITCH_STATUS_SUCCESS) {
-            switch_log_printf(
-                SWITCH_CHANNEL_SESSION_LOG(session),
-                SWITCH_LOG_WARNING,
-                "(%s) inbound playback timer init failed packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
-                state->session_id.c_str(),
-                state->packet_ms,
-                static_cast<switch_size_t>(state->packet_samples)
-            );
-            switch_core_session_rwunlock(session);
-            finalize_active_window(state.get());
-            continue;
-        }
-
-        timer_initialized = true;
-        switch_core_timer_sync(&timer);
-
-        if (state->debug_enabled) {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            switch_log_printf(
-                SWITCH_CHANNEL_SESSION_LOG(session),
-                SWITCH_LOG_DEBUG,
-                "(%s) inbound playback active window opened generation=%" PRIu64 " state=%s\n",
-                state->session_id.c_str(),
-                state->generation,
-                playback_state_name(state->state)
-            );
-        }
-
-        while (switch_channel_ready(channel)) {
+    try {
+        while (true) {
             {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->closed || !playback_state_is_active(state->state)) {
+                std::unique_lock<std::mutex> lock(state->mutex);
+                state->cond.wait(lock, [&state]() {
+                    return state->closed || playback_state_is_active(state->state);
+                });
+
+                if (state->closed) {
                     break;
                 }
             }
 
-            const switch_status_t status = switch_core_timer_next(&timer);
-            if (status != SWITCH_STATUS_SUCCESS) {
-                final_status = status;
+            switch_core_session_t *session = switch_core_session_locate(state->session_id.c_str());
+            if (!session) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_LOG,
+                    SWITCH_LOG_WARNING,
+                    "(%s) inbound playback failed to locate session for active window\n",
+                    state->session_id.c_str()
+                );
                 finalize_active_window(state.get());
-                break;
+                continue;
+            }
+
+            switch_channel_t *channel = switch_core_session_get_channel(session);
+            switch_timer_t timer = {};
+            bool timer_initialized = false;
+            switch_status_t final_status = SWITCH_STATUS_SUCCESS;
+
+            if (switch_core_timer_init(&timer, "soft", static_cast<int>(state->packet_ms), static_cast<int>(state->packet_samples), NULL) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_WARNING,
+                    "(%s) inbound playback timer init failed packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
+                    state->session_id.c_str(),
+                    state->packet_ms,
+                    static_cast<switch_size_t>(state->packet_samples)
+                );
+                switch_core_session_rwunlock(session);
+                finalize_active_window(state.get());
+                continue;
+            }
+
+            timer_initialized = true;
+            switch_core_timer_sync(&timer);
+
+            if (state->debug_enabled) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(session),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) inbound playback active window opened generation=%" PRIu64 " state=%s\n",
+                    state->session_id.c_str(),
+                    state->generation,
+                    playback_state_name(state->state)
+                );
+            }
+
+            while (switch_channel_ready(channel)) {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->closed || !playback_state_is_active(state->state)) {
+                        break;
+                    }
+                }
+
+                const switch_status_t status = switch_core_timer_next(&timer);
+                if (status != SWITCH_STATUS_SUCCESS) {
+                    final_status = status;
+                    finalize_active_window(state.get());
+                    break;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->timer_ticks++;
+                    if (state->debug_enabled && !state->first_timer_tick_logged) {
+                        state->first_timer_tick_logged = true;
+                        switch_log_printf(
+                            SWITCH_CHANNEL_SESSION_LOG(session),
+                            SWITCH_LOG_DEBUG,
+                            "(%s) inbound playback first timer tick packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
+                            state->session_id.c_str(),
+                            state->packet_ms,
+                            static_cast<switch_size_t>(state->packet_samples)
+                        );
+                    }
+                    if (state->debug_enabled && ((state->timer_ticks % 50) == 0)) {
+                        switch_log_printf(
+                            SWITCH_CHANNEL_SESSION_LOG(session),
+                            SWITCH_LOG_DEBUG,
+                            "(%s) inbound playback timer checkpoint ticks=%" PRIu64 " state=%s\n",
+                            state->session_id.c_str(),
+                            state->timer_ticks,
+                            playback_state_name(state->state)
+                        );
+                    }
+                }
+
+                if (write_next_frame(session, state.get()) != SWITCH_STATUS_SUCCESS) {
+                    final_status = SWITCH_STATUS_FALSE;
+                    finalize_active_window(state.get());
+                    break;
+                }
             }
 
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
-                state->timer_ticks++;
-                if (state->debug_enabled && !state->first_timer_tick_logged) {
-                    state->first_timer_tick_logged = true;
+                if (state->debug_enabled) {
                     switch_log_printf(
                         SWITCH_CHANNEL_SESSION_LOG(session),
                         SWITCH_LOG_DEBUG,
-                        "(%s) inbound playback first timer tick packet_ms=%u packet_samples=%" SWITCH_SIZE_T_FMT "\n",
+                        "(%s) inbound playback active window closed status=%d channel_ready=%d closed=%d state=%s ticks=%" PRIu64 " writes=%" PRIu64 "\n",
                         state->session_id.c_str(),
-                        state->packet_ms,
-                        static_cast<switch_size_t>(state->packet_samples)
-                    );
-                }
-                if (state->debug_enabled && ((state->timer_ticks % 50) == 0)) {
-                    switch_log_printf(
-                        SWITCH_CHANNEL_SESSION_LOG(session),
-                        SWITCH_LOG_DEBUG,
-                        "(%s) inbound playback timer checkpoint ticks=%" PRIu64 " state=%s\n",
-                        state->session_id.c_str(),
+                        final_status,
+                        switch_channel_ready(channel) ? 1 : 0,
+                        state->closed ? 1 : 0,
+                        playback_state_name(state->state),
                         state->timer_ticks,
-                        playback_state_name(state->state)
+                        state->write_calls
                     );
                 }
             }
 
-            if (write_next_frame(session, state.get()) != SWITCH_STATUS_SUCCESS) {
-                final_status = SWITCH_STATUS_FALSE;
+            if (timer_initialized) {
+                switch_core_timer_destroy(&timer);
+            }
+
+            switch_core_session_rwunlock(session);
+
+            if (!switch_channel_ready(channel)) {
                 finalize_active_window(state.get());
-                break;
             }
         }
-
-        if (state->debug_enabled) {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            switch_log_printf(
-                SWITCH_CHANNEL_SESSION_LOG(session),
-                SWITCH_LOG_DEBUG,
-                "(%s) inbound playback active window closed status=%d channel_ready=%d closed=%d state=%s ticks=%" PRIu64 " writes=%" PRIu64 "\n",
-                state->session_id.c_str(),
-                final_status,
-                switch_channel_ready(channel) ? 1 : 0,
-                state->closed ? 1 : 0,
-                playback_state_name(state->state),
-                state->timer_ticks,
-                state->write_calls
-            );
-        }
-
-        if (timer_initialized) {
-            switch_core_timer_destroy(&timer);
-        }
-
-        switch_core_session_rwunlock(session);
-
-        if (!switch_channel_ready(channel)) {
-            finalize_active_window(state.get());
-        }
+    } catch (const std::exception& e) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) inbound playback thread exception: %s\n", state->session_id.c_str(), e.what());
+        finalize_active_window(state.get());
+    } catch (...) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%s) inbound playback thread exception\n", state->session_id.c_str());
+        finalize_active_window(state.get());
     }
 
     {
@@ -783,8 +819,8 @@ switch_status_t inbound_playback_session_init(switch_core_session_t *session, pr
         packet_bytes / (sizeof(int16_t) * static_cast<size_t>(target_channels ? target_channels : 1));
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
-    const uint32_t max_buffer_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS", kDefaultMaxBufferMs);
-    const uint32_t preroll_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_PREROLL_MS", kDefaultPrerollMs);
+    const uint32_t max_buffer_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS", kDefaultMaxBufferMs, kMinBufferMs, kMaxBufferMs);
+    const uint32_t preroll_ms = get_channel_var_ms(channel, "STREAM_LIVE_PLAYBACK_PREROLL_MS", kDefaultPrerollMs, 0, std::min(max_buffer_ms, kMaxPrerollMs));
 
     auto state = std::make_shared<InboundPlaybackState>(
         tech_pvt->sessionId,
@@ -1072,13 +1108,7 @@ switch_status_t inbound_playback_append(private_t *tech_pvt, const void *data, s
     const auto *normalized_bytes = reinterpret_cast<const uint8_t *>(normalized.data());
     size_t dropped_bytes = 0;
 
-    if (state->buffer.size() == 0 && normalized_size > state->buffer.capacity()) {
-        const size_t written = state->buffer.write(normalized_bytes, state->buffer.capacity());
-        dropped_bytes = normalized_size - written;
-    } else {
-        const size_t written = state->buffer.write(normalized_bytes, normalized_size);
-        dropped_bytes = normalized_size - written;
-    }
+    state->buffer.write(normalized_bytes, normalized_size, &dropped_bytes);
 
     if (dropped_bytes > 0) {
         state->overflow_events++;

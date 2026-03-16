@@ -87,10 +87,14 @@ The following channel variables can be used to fine tune websocket connection an
 | STREAM_MESSAGE_DEFLATE                 | true or 1, disables per message deflate                 | off     |
 | STREAM_HEART_BEAT                      | number of seconds, interval to send the heart beat      | off     |
 | STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
-| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
+| STREAM_BUFFER_SIZE                     | outbound websocket chunk duration in ms, 20-1000        | 20      |
 | STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
+| STREAM_STOP_ON_DISCONNECT              | true or 1, stop streaming when websocket closes         | true    |
+| STREAM_MAX_INBOUND_QUEUE_MESSAGES      | max queued inbound ws messages before disconnect        | 100     |
+| STREAM_MAX_INBOUND_QUEUE_BYTES         | max queued inbound ws bytes before disconnect           | 1048576 |
+| STREAM_MAX_BINARY_FRAME_BYTES          | max single inbound binary ws frame size in bytes        | 65536   |
 | STREAM_OUTBOUND_DEBUG                  | enable verbose outbound audio diagnostics               | off     |
-| STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS     | bounded live playback buffer for inbound binary audio   | 500     |
+| STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS     | bounded live playback buffer for inbound binary audio   | 5000    |
 | STREAM_LIVE_PLAYBACK_PREROLL_MS        | preroll before live playback starts                     | 60      |
 | STREAM_LIVE_PLAYBACK_DEBUG             | enable verbose live playback diagnostics                | off     |
 | ~~STREAM_NO_RECONNECT~~                    | true or 1, disables automatic websocket reconnection    | off     |
@@ -100,11 +104,11 @@ The following channel variables can be used to fine tune websocket connection an
 | STREAM_TLS_DISABLE_HOSTNAME_VALIDATION | true or 1 disable hostname check in WSS connections     | false   |
 
 - Per message deflate compression option is enabled by default. It can lead to a very nice bandwidth savings. To disable it set the channel var to `true|1`.
-- Heart beat, sent every xx seconds when there is no traffic to make sure that load balancers do not kill an idle connection.
+- Heart beat is sent when there is no traffic to keep idle connections alive. Valid range is `1-3600` seconds.
 - Suppress parameter is omitted by default(false). All the responses from websocket server will be printed to the log. Not to flood the log you can suppress it by setting the value to `true|1`. Events are fired still, it only affects printing to the log.
 - `Buffer Size` actually represents a duration of audio chunk sent to websocket. If you want to send e.g. 100ms audio packets to your ws endpoint
-you would set this variable to 100. If ommited, default packet size of 20ms will be sent as grabbed from the audio channel (which is default FreeSWITCH frame size)
-- Extra headers should be a JSON object with key-value pairs representing additional HTTP headers. Each key should be a header name, and its corresponding value should be a string.
+you would set this variable to 100. It must be divisible by `20` and is bounded to `20-1000ms`.
+- Extra headers should be a JSON object with key-value pairs representing additional HTTP headers. Header names must be valid HTTP tokens, values cannot contain CR/LF, and oversized header blobs are rejected.
   ```json
   {
       "Header1": "Value1",
@@ -113,10 +117,12 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
   }
 - ~~Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.~~
   - libwsc does not support automatic reconnection.
-- `STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS` bounds the in-memory buffer used for live inbound binary PCM playback. When the buffer fills, the oldest audio is dropped to keep latency bounded.
+- `STREAM_STOP_ON_DISCONNECT` defaults to `true`. Unexpected websocket disconnects stop the media bug and clean up the stream.
+- `STREAM_MAX_INBOUND_QUEUE_MESSAGES`, `STREAM_MAX_INBOUND_QUEUE_BYTES`, and `STREAM_MAX_BINARY_FRAME_BYTES` bound hostile or bursty inbound websocket traffic. Limit violations emit an error event and disconnect the websocket.
+- `STREAM_LIVE_PLAYBACK_MAX_BUFFER_MS` bounds the in-memory buffer used for live inbound binary PCM playback. Default is `5000ms`. When the buffer fills, the oldest audio is dropped to keep latency bounded.
 - `STREAM_LIVE_PLAYBACK_PREROLL_MS` controls how much buffered audio is accumulated before live inbound playback starts.
-- `STREAM_OUTBOUND_DEBUG` enables detailed outbound mic-stream diagnostics, including websocket write sizes and buffer flush totals.
-- `STREAM_LIVE_PLAYBACK_DEBUG` enables detailed logs for live inbound playback: stream start, binary append checkpoints, file open/read/EOF, zero-fill underruns, and cleanup counters.
+- `STREAM_OUTBOUND_DEBUG` enables detailed outbound mic-stream diagnostics, including queueing and drop counters.
+- `STREAM_LIVE_PLAYBACK_DEBUG` enables detailed logs for live inbound playback: stream start, binary append checkpoints, zero-fill underruns, overflow counters, and cleanup counters.
 - TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
   - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.
 Can be `NONE` which result in no peer verification.
@@ -169,6 +175,13 @@ Pauses audio stream
 uuid_audio_stream <uuid> resume
 ```
 Resumes audio stream
+
+## Threading And Resource Model
+
+- Each session currently uses one inbound websocket worker thread and one inbound playback playout thread.
+- Outbound audio capture happens in the media-bug callback, but websocket sending is moved onto an internal sender worker so the callback does not call websocket send directly.
+- Outbound websocket audio is buffered in a bounded in-memory queue with drop-oldest behavior to keep latency bounded under congestion.
+- Inbound websocket messages are queued behind explicit message/byte caps. Overflow is treated as a protocol/backpressure failure and disconnects the websocket.
 
 ## Events
 Module will generate the following event types:

@@ -3,6 +3,7 @@
 #include "mod_audio_stream.h"
 #include "inbound_playback.h"
 #include "WebSocketClient.h"
+#include "Utf8Validator.h"
 #include <switch_json.h>
 #include <fstream>
 #include <switch_buffer.h>
@@ -14,9 +15,171 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <cctype>
+#include <climits>
+#include <cstdio>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+
+namespace {
+
+constexpr uint32_t kDefaultHeartbeatSeconds = 0;
+constexpr uint32_t kMaxHeartbeatSeconds = 3600;
+constexpr uint32_t kDefaultBufferSizeMs = 20;
+constexpr uint32_t kMaxBufferSizeMs = 1000;
+constexpr size_t kDefaultMaxInboundQueueMessages = 100;
+constexpr size_t kDefaultMaxInboundQueueBytes = 1024 * 1024;
+constexpr size_t kDefaultMaxBinaryFrameBytes = 64 * 1024;
+constexpr size_t kMaxExtraHeadersBytes = 8192;
+constexpr uint32_t kMaxInboundSampleRate = 48000;
+
+volatile switch_atomic_t g_active_streams = 0;
+
+bool is_sensitive_key(const char* key) {
+    if (!key) {
+        return false;
+    }
+
+    return !strcasecmp(key, "authorization") ||
+           !strcasecmp(key, "proxy-authorization") ||
+           !strcasecmp(key, "x-api-key") ||
+           !strcasecmp(key, "api-key") ||
+           !strcasecmp(key, "token") ||
+           !strcasecmp(key, "access-token");
+}
+
+bool is_header_token(const char* value) {
+    if (!value || !*value) {
+        return false;
+    }
+
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+        const unsigned char c = *p;
+        if (std::isalnum(c)) {
+            continue;
+        }
+
+        switch (c) {
+            case '!':
+            case '#':
+            case '$':
+            case '%':
+            case '&':
+            case '\'':
+            case '*':
+            case '+':
+            case '-':
+            case '.':
+            case '^':
+            case '_':
+            case '`':
+            case '|':
+            case '~':
+                continue;
+            default:
+                return false;
+        }
+    }
+
+    return true;
+}
+
+bool contains_ctl_or_space(const char* value) {
+    if (!value) {
+        return true;
+    }
+
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+        if (*p <= 0x20 || *p == 0x7f) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool contains_crlf(const char* value) {
+    if (!value) {
+        return true;
+    }
+
+    for (const char* p = value; *p; ++p) {
+        if (*p == '\r' || *p == '\n') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+uint32_t parse_ms_setting(
+    switch_channel_t* channel,
+    const char* name,
+    uint32_t fallback,
+    uint32_t min_value,
+    uint32_t max_value
+) {
+    const char* raw = switch_channel_get_variable(channel, name);
+    if (zstr(raw)) {
+        return fallback;
+    }
+
+    char* endptr = nullptr;
+    unsigned long parsed = std::strtoul(raw, &endptr, 10);
+    if (!endptr || *endptr != '\0' || parsed < min_value || parsed > max_value) {
+        return fallback;
+    }
+
+    return static_cast<uint32_t>(parsed);
+}
+
+size_t parse_size_setting(
+    switch_channel_t* channel,
+    const char* name,
+    size_t fallback,
+    size_t min_value,
+    size_t max_value
+) {
+    const char* raw = switch_channel_get_variable(channel, name);
+    if (zstr(raw)) {
+        return fallback;
+    }
+
+    char* endptr = nullptr;
+    unsigned long long parsed = std::strtoull(raw, &endptr, 10);
+    if (!endptr || *endptr != '\0' || parsed < min_value || parsed > max_value) {
+        return fallback;
+    }
+
+    return static_cast<size_t>(parsed);
+}
+
+std::string build_error_json(int code, const char* error, const char* detail = nullptr) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON* message = cJSON_CreateObject();
+    if (!root || !message) {
+        if (root) cJSON_Delete(root);
+        if (message) cJSON_Delete(message);
+        return "{\"status\":\"error\"}";
+    }
+
+    cJSON_AddStringToObject(root, "status", "error");
+    cJSON_AddNumberToObject(message, "code", code);
+    cJSON_AddStringToObject(message, "error", error ? error : "error");
+    if (detail && *detail) {
+        cJSON_AddStringToObject(message, "detail", detail);
+    }
+    cJSON_AddItemToObject(root, "message", message);
+
+    char* json = cJSON_PrintUnformatted(root);
+    std::string payload = json ? json : "{\"status\":\"error\"}";
+    cJSON_Delete(root);
+    switch_safe_free(json);
+    return payload;
+}
+
+}  // namespace
 
 class AudioStreamer {
 public:
@@ -24,12 +187,16 @@ public:
     static std::shared_ptr<AudioStreamer> create(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
         bool suppressLog, bool outboundDebug, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
-        const char* tls_certfile, bool tls_disable_hostname_validation) {
+        const char* tls_certfile, bool tls_disable_hostname_validation,
+        bool stop_on_disconnect, size_t max_inbound_queue_messages,
+        size_t max_inbound_queue_bytes, size_t max_binary_frame_bytes) {
 
         std::shared_ptr<AudioStreamer> sp(new AudioStreamer(
             uuid, wsUri, callback, deflate, heart_beat,
             suppressLog, outboundDebug, extra_headers, tls_cafile, tls_keyfile, 
-            tls_certfile, tls_disable_hostname_validation
+            tls_certfile, tls_disable_hostname_validation,
+            stop_on_disconnect, max_inbound_queue_messages,
+            max_inbound_queue_bytes, max_binary_frame_bytes
         ));
 
         sp->bindCallbacks(std::weak_ptr<AudioStreamer>(sp));
@@ -40,7 +207,7 @@ public:
     }
 
     ~AudioStreamer() {
-        stopInboundWorker();
+        stopWorkers();
     }
 
     void disconnect() {
@@ -93,12 +260,20 @@ public:
 
     void markCleanedUp() {
         m_cleanedUp.store(true, std::memory_order_release);
-        stopInboundWorker();
+        stopWorkers();
         client.setMessageCallback({});
         client.setBinaryCallback({});
         client.setOpenCallback({});
         client.setErrorCallback({});
         client.setCloseCallback({});
+    }
+
+    void notifyOutboundData() {
+        {
+            std::lock_guard<std::mutex> lock(m_outboundMutex);
+            m_outboundPending = true;
+        }
+        m_outboundCond.notify_one();
     }
 
     bool isCleanedUp() const {
@@ -110,20 +285,36 @@ private:
     AudioStreamer(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
         bool suppressLog, bool outboundDebug, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
-        const char* tls_certfile, bool tls_disable_hostname_validation
+        const char* tls_certfile, bool tls_disable_hostname_validation,
+        bool stop_on_disconnect, size_t max_inbound_queue_messages,
+        size_t max_inbound_queue_bytes, size_t max_binary_frame_bytes
     ) : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), 
-        m_outbound_debug(outboundDebug), m_extra_headers(extra_headers), m_playFile(0) {
+        m_outbound_debug(outboundDebug), m_extra_headers(extra_headers), m_playFile(0),
+        m_stop_on_disconnect(stop_on_disconnect),
+        m_maxInboundQueueMessages(max_inbound_queue_messages),
+        m_maxInboundQueueBytes(max_inbound_queue_bytes),
+        m_maxBinaryFrameBytes(max_binary_frame_bytes) {
 
         WebSocketHeaders hdrs;
         WebSocketTLSOptions tls;
 
-        if (m_extra_headers) {
+        if (m_extra_headers && std::strlen(m_extra_headers) <= kMaxExtraHeadersBytes) {
             cJSON *headers_json = cJSON_Parse(m_extra_headers);
             if (headers_json) {
                 cJSON *iterator = headers_json->child;
                 while (iterator) {
-                    if (iterator->type == cJSON_String && iterator->valuestring != nullptr) {
+                    if (iterator->type == cJSON_String && iterator->valuestring != nullptr &&
+                        iterator->string && is_header_token(iterator->string) &&
+                        !contains_crlf(iterator->valuestring)) {
                         hdrs.set(iterator->string, iterator->valuestring);
+                    } else if (iterator->string && iterator->type == cJSON_String && iterator->valuestring != nullptr) {
+                        switch_log_printf(
+                            SWITCH_CHANNEL_LOG,
+                            SWITCH_LOG_WARNING,
+                            "(%s) ignoring unsafe extra header %s\n",
+                            m_sessionId.c_str(),
+                            is_sensitive_key(iterator->string) ? "[redacted]" : iterator->string
+                        );
                     }
                     iterator = iterator->next;
                 }
@@ -165,6 +356,7 @@ private:
             client.setHeaders(hdrs);
 
         m_inboundWorker = std::thread(&AudioStreamer::processInboundQueue, this);
+        m_outboundWorker = std::thread(&AudioStreamer::processOutboundQueue, this);
     }
 
     struct ProcessResult {
@@ -188,19 +380,47 @@ private:
         out.errors.push_back("(" + sid + ") " + s);
     }
 
+    void emitErrorAndDisconnect(int code, const char* error, const char* detail = nullptr) {
+        if (isCleanedUp()) {
+            return;
+        }
+
+        const std::string payload = build_error_json(code, error, detail);
+        switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+        if (psession) {
+            m_notify(psession, EVENT_ERROR, payload.c_str());
+            media_bug_close(psession);
+            switch_core_session_rwunlock(psession);
+        }
+
+        client.disconnect();
+    }
+
     void bindCallbacks(std::weak_ptr<AudioStreamer> wp) {
         client.setMessageCallback([wp](const std::string& message) {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
-            self->enqueueText(message);
+            try {
+                self->enqueueText(message);
+            } catch (const std::exception& e) {
+                self->emitErrorAndDisconnect(4500, "inbound_text_exception", e.what());
+            } catch (...) {
+                self->emitErrorAndDisconnect(4500, "inbound_text_exception");
+            }
         });
 
         client.setBinaryCallback([wp](const void* data, size_t len) {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
-            self->enqueueBinary(data, len);
+            try {
+                self->enqueueBinary(data, len);
+            } catch (const std::exception& e) {
+                self->emitErrorAndDisconnect(4501, "inbound_binary_exception", e.what());
+            } catch (...) {
+                self->emitErrorAndDisconnect(4501, "inbound_binary_exception");
+            }
         });
 
         client.setOpenCallback([wp]() {
@@ -208,14 +428,18 @@ private:
             if (!self) return;
             if (self->isCleanedUp()) return;
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "connected");
-            char* json_str = cJSON_PrintUnformatted(root);
-
-            self->notifySessionEvent(CONNECT_SUCCESS, json_str);
-
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+            try {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "connected");
+                char* json_str = cJSON_PrintUnformatted(root);
+                self->notifySessionEvent(CONNECT_SUCCESS, json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            } catch (const std::exception& e) {
+                self->emitErrorAndDisconnect(4502, "open_callback_exception", e.what());
+            } catch (...) {
+                self->emitErrorAndDisconnect(4502, "open_callback_exception");
+            }
         });
 
         client.setErrorCallback([wp](int code, const std::string& msg) {
@@ -223,19 +447,23 @@ private:
             if (!self) return;
             if (self->isCleanedUp()) return;
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "error");
-            cJSON* message = cJSON_CreateObject();
-            cJSON_AddNumberToObject(message, "code", code);
-            cJSON_AddStringToObject(message, "error", msg.c_str());
-            cJSON_AddItemToObject(root, "message", message);
+            try {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "error");
+                cJSON* message = cJSON_CreateObject();
+                cJSON_AddNumberToObject(message, "code", code);
+                cJSON_AddStringToObject(message, "error", msg.c_str());
+                cJSON_AddItemToObject(root, "message", message);
 
-            char* json_str = cJSON_PrintUnformatted(root);
+                char* json_str = cJSON_PrintUnformatted(root);
 
-            self->notifySessionEvent(CONNECT_ERROR, json_str);
+                self->notifySessionEvent(CONNECT_ERROR, json_str);
 
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            } catch (...) {
+                self->emitErrorAndDisconnect(4503, "error_callback_exception");
+            }
         });
 
         client.setCloseCallback([wp](int code, const std::string& reason) {
@@ -243,19 +471,23 @@ private:
             if (!self) return;
             if (self->isCleanedUp()) return;
 
-            cJSON* root = cJSON_CreateObject();
-            cJSON_AddStringToObject(root, "status", "disconnected");
-            cJSON* message = cJSON_CreateObject();
-            cJSON_AddNumberToObject(message, "code", code);
-            cJSON_AddStringToObject(message, "reason", reason.c_str());
-            cJSON_AddItemToObject(root, "message", message);
+            try {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "status", "disconnected");
+                cJSON* message = cJSON_CreateObject();
+                cJSON_AddNumberToObject(message, "code", code);
+                cJSON_AddStringToObject(message, "reason", reason.c_str());
+                cJSON_AddItemToObject(root, "message", message);
 
-            char* json_str = cJSON_PrintUnformatted(root);
+                char* json_str = cJSON_PrintUnformatted(root);
 
-            self->notifySessionEvent(CONNECTION_DROPPED, json_str);
+                self->notifySessionEvent(CONNECTION_DROPPED, json_str);
 
-            cJSON_Delete(root);
-            switch_safe_free(json_str);
+                cJSON_Delete(root);
+                switch_safe_free(json_str);
+            } catch (...) {
+                self->emitErrorAndDisconnect(4504, "close_callback_exception");
+            }
         });
     }
 
@@ -272,7 +504,7 @@ private:
         auto *bug = get_media_bug(session);
         if(bug) {
             auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            tech_pvt->close_requested = 1;
+            switch_atomic_set(&tech_pvt->close_requested, 1);
             switch_core_media_bug_close(&bug, SWITCH_FALSE);
         }
     }
@@ -283,7 +515,8 @@ private:
             auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
             if(tech_pvt && strlen(tech_pvt->initialMetadata) > 0) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                                          "sending initial metadata %s\n", tech_pvt->initialMetadata);
+                                  "sending initial metadata len=%" SWITCH_SIZE_T_FMT "\n",
+                                  (switch_size_t)strlen(tech_pvt->initialMetadata));
                 writeText(tech_pvt->initialMetadata);
             }
         }
@@ -292,13 +525,29 @@ private:
     void enqueueText(const std::string& message) {
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
-            m_inboundQueue.push_back(InboundMessage{InboundMessageType::Text, message, {}});
+            if (m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.size()) > m_maxInboundQueueBytes) {
+                m_inboundOverflowed = true;
+            } else {
+                m_inboundQueueBytes += message.size();
+                m_inboundQueue.push_back(InboundMessage{InboundMessageType::Text, message, {}});
+            }
         }
+
+        if (m_inboundOverflowed) {
+            emitErrorAndDisconnect(4408, "inbound_queue_overflow", "text queue limit exceeded");
+            return;
+        }
+
         m_inboundCond.notify_one();
     }
 
     void enqueueBinary(const void* data, size_t len) {
         if (!data || !len) {
+            return;
+        }
+
+        if (len > m_maxBinaryFrameBytes) {
+            emitErrorAndDisconnect(4409, "binary_frame_too_large", "inbound binary frame exceeded configured limit");
             return;
         }
 
@@ -308,21 +557,52 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
-            m_inboundQueue.push_back(std::move(message));
+            if (m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.binary.size()) > m_maxInboundQueueBytes) {
+                m_inboundOverflowed = true;
+            } else {
+                m_inboundQueueBytes += message.binary.size();
+                m_inboundQueue.push_back(std::move(message));
+            }
         }
+
+        if (m_inboundOverflowed) {
+            emitErrorAndDisconnect(4408, "inbound_queue_overflow", "binary queue limit exceeded");
+            return;
+        }
+
         m_inboundCond.notify_one();
     }
 
-    void stopInboundWorker() {
+    void stopWorkers() {
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
             m_stopInboundWorker = true;
+            m_inboundQueueBytes = 0;
             m_inboundQueue.clear();
         }
         m_inboundCond.notify_all();
 
         if (m_inboundWorker.joinable()) {
-            m_inboundWorker.join();
+            if (m_inboundWorker.get_id() == std::this_thread::get_id()) {
+                m_inboundWorker.detach();
+            } else {
+                m_inboundWorker.join();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_outboundMutex);
+            m_stopOutboundWorker = true;
+            m_outboundPending = true;
+        }
+        m_outboundCond.notify_all();
+
+        if (m_outboundWorker.joinable()) {
+            if (m_outboundWorker.get_id() == std::this_thread::get_id()) {
+                m_outboundWorker.detach();
+            } else {
+                m_outboundWorker.join();
+            }
         }
     }
 
@@ -336,41 +616,110 @@ private:
     }
 
     void processInboundQueue() {
-        while (true) {
-            InboundMessage message;
+        try {
+            while (true) {
+                InboundMessage message;
 
-            {
-                std::unique_lock<std::mutex> lock(m_inboundMutex);
-                m_inboundCond.wait(lock, [this]() {
-                    return m_stopInboundWorker || !m_inboundQueue.empty();
-                });
+                {
+                    std::unique_lock<std::mutex> lock(m_inboundMutex);
+                    m_inboundCond.wait(lock, [this]() {
+                        return m_stopInboundWorker || !m_inboundQueue.empty();
+                    });
 
-                if (m_stopInboundWorker && m_inboundQueue.empty()) {
-                    return;
+                    if (m_stopInboundWorker && m_inboundQueue.empty()) {
+                        return;
+                    }
+
+                    message = std::move(m_inboundQueue.front());
+                    if (message.type == InboundMessageType::Text) {
+                        m_inboundQueueBytes -= message.text.size();
+                    } else {
+                        m_inboundQueueBytes -= message.binary.size();
+                    }
+                    m_inboundQueue.pop_front();
                 }
 
-                message = std::move(m_inboundQueue.front());
-                m_inboundQueue.pop_front();
-            }
+                switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+                if (!psession) {
+                    continue;
+                }
 
-            switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
-            if (!psession) {
-                continue;
-            }
+                auto *tech_pvt = get_private_data(psession);
+                if (!tech_pvt) {
+                    switch_core_session_rwunlock(psession);
+                    continue;
+                }
 
-            auto *tech_pvt = get_private_data(psession);
-            if (!tech_pvt) {
+                if (message.type == InboundMessageType::Text) {
+                    processQueuedText(psession, tech_pvt, message.text);
+                } else {
+                    processQueuedBinary(psession, tech_pvt, message.binary);
+                }
+
                 switch_core_session_rwunlock(psession);
-                continue;
             }
+        } catch (const std::exception& e) {
+            emitErrorAndDisconnect(4505, "inbound_worker_exception", e.what());
+        } catch (...) {
+            emitErrorAndDisconnect(4505, "inbound_worker_exception");
+        }
+    }
 
-            if (message.type == InboundMessageType::Text) {
-                processQueuedText(psession, tech_pvt, message.text);
-            } else {
-                processQueuedBinary(psession, tech_pvt, message.binary);
+    void processOutboundQueue() {
+        try {
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(m_outboundMutex);
+                    m_outboundCond.wait(lock, [this]() {
+                        return m_stopOutboundWorker || m_outboundPending;
+                    });
+
+                    if (m_stopOutboundWorker) {
+                        return;
+                    }
+
+                    m_outboundPending = false;
+                }
+
+                switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+                if (!psession) {
+                    continue;
+                }
+
+                auto* tech_pvt = get_private_data(psession);
+                if (!tech_pvt) {
+                    switch_core_session_rwunlock(psession);
+                    continue;
+                }
+
+                while (client.isConnected()) {
+                    switch_size_t bytes_to_read = 0;
+                    std::vector<uint8_t> chunk;
+
+                    switch_mutex_lock(tech_pvt->mutex);
+                    if (tech_pvt->sbuffer) {
+                        const switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
+                        if (tech_pvt->outbound_chunk_bytes > 0 && inuse >= tech_pvt->outbound_chunk_bytes) {
+                            bytes_to_read = tech_pvt->outbound_chunk_bytes;
+                            chunk.resize(bytes_to_read);
+                            switch_buffer_read(tech_pvt->sbuffer, chunk.data(), bytes_to_read);
+                        }
+                    }
+                    switch_mutex_unlock(tech_pvt->mutex);
+
+                    if (!bytes_to_read) {
+                        break;
+                    }
+
+                    writeBinary(chunk.data(), chunk.size());
+                }
+
+                switch_core_session_rwunlock(psession);
             }
-
-            switch_core_session_rwunlock(psession);
+        } catch (const std::exception& e) {
+            emitErrorAndDisconnect(4506, "outbound_worker_exception", e.what());
+        } catch (...) {
+            emitErrorAndDisconnect(4506, "outbound_worker_exception");
         }
     }
 
@@ -391,6 +740,9 @@ private:
             case CONNECTION_DROPPED:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection closed\n");
                 m_notify(psession, EVENT_DISCONNECT, msg.c_str());
+                if (m_stop_on_disconnect) {
+                    media_bug_close(psession);
+                }
                 break;
 
             case CONNECT_ERROR:
@@ -441,6 +793,15 @@ private:
             event_name,
             message.empty() ? nullptr : message.c_str()
         );
+    }
+
+    void emitProtocolError(switch_core_session_t* session, private_t* tech_pvt, int code, const char* detail) {
+        if (!session || !tech_pvt || !tech_pvt->responseHandler) {
+            return;
+        }
+
+        const std::string payload = build_error_json(code, "protocol_error", detail);
+        tech_pvt->responseHandler(session, EVENT_ERROR, payload.c_str());
     }
 
     std::string buildControlEventPayload(
@@ -510,12 +871,13 @@ private:
             const uint32_t sample_rate = get_uint_field(root.get(), json_data, "rate", get_uint_field(root.get(), json_data, "sampleRate"));
             const uint32_t channels = get_uint_field(root.get(), json_data, "channels", 1);
             char resolved_playback_id[512] = "";
+            const bool any_format_field = format || audio_data_type || encoding;
+            const bool format_ok = !format || std::strcmp(format, "pcm16") == 0;
+            const bool audio_type_ok = !audio_data_type || std::strcmp(audio_data_type, "raw") == 0;
+            const bool encoding_ok = !encoding || std::strcmp(encoding, "pcm_s16le") == 0;
 
-            const bool format_ok = (format && std::strcmp(format, "pcm16") == 0) ||
-                                   (audio_data_type && std::strcmp(audio_data_type, "raw") == 0) ||
-                                   (encoding && std::strcmp(encoding, "pcm_s16le") == 0);
-
-            if (!format_ok || !sample_rate || channels != 1) {
+            if (!any_format_field || !format_ok || !audio_type_ok || !encoding_ok ||
+                !sample_rate || sample_rate > kMaxInboundSampleRate || channels != 1) {
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
                     SWITCH_LOG_ERROR,
@@ -527,6 +889,7 @@ private:
                     audio_data_type ? audio_data_type : "",
                     encoding ? encoding : ""
                 );
+                emitProtocolError(session, tech_pvt, 4410, "invalid streamAudioBegin payload");
                 return true;
             }
 
@@ -547,6 +910,7 @@ private:
                     "(%s) failed to start inbound playback stream\n",
                     tech_pvt->sessionId
                 );
+                emitProtocolError(session, tech_pvt, 4410, "failed to start inbound playback");
             }
             else {
                 switch_log_printf(
@@ -587,7 +951,9 @@ private:
                 "(%s) received streamAudioEnd\n",
                 tech_pvt->sessionId
             );
-            inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id));
+            if (inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id)) != SWITCH_STATUS_SUCCESS) {
+                emitProtocolError(session, tech_pvt, 4411, "streamAudioEnd without active playback");
+            }
             emitControlEvent(
                 session,
                 tech_pvt,
@@ -605,13 +971,20 @@ private:
                 "(%s) received streamAudioCancel\n",
                 tech_pvt->sessionId
             );
-            inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id));
+            if (inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id)) != SWITCH_STATUS_SUCCESS) {
+                emitProtocolError(session, tech_pvt, 4412, "streamAudioCancel without active playback");
+            }
             emitControlEvent(
                 session,
                 tech_pvt,
                 EVENT_STREAM_AUDIO_CANCEL,
                 buildControlEventPayload("streamAudioCancel", playback_id)
             );
+            return true;
+        }
+
+        if (!std::strncmp(json_type, "streamAudio", std::strlen("streamAudio"))) {
+            emitProtocolError(session, tech_pvt, 4413, "unsupported streamAudio control message");
             return true;
         }
 
@@ -794,6 +1167,10 @@ private:
     bool m_outbound_debug;
     const char* m_extra_headers;
     int m_playFile;
+    bool m_stop_on_disconnect;
+    size_t m_maxInboundQueueMessages;
+    size_t m_maxInboundQueueBytes;
+    size_t m_maxBinaryFrameBytes;
     std::unordered_set<std::string> m_Files;
     std::atomic<bool> m_cleanedUp{false};
     std::mutex m_stateMutex;
@@ -802,16 +1179,27 @@ private:
     std::deque<InboundMessage> m_inboundQueue;
     std::thread m_inboundWorker;
     bool m_stopInboundWorker = false;
+    bool m_inboundOverflowed = false;
+    size_t m_inboundQueueBytes = 0;
+    std::mutex m_outboundMutex;
+    std::condition_variable m_outboundCond;
+    std::thread m_outboundWorker;
+    bool m_stopOutboundWorker = false;
+    bool m_outboundPending = false;
 };
 
 
 namespace {
 
+    constexpr size_t kOutboundQueueDepthChunks = 8;
+
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
                                      uint32_t sampling, int desiredSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool suppressLog, int rtp_packets, const char* extra_headers,
                                      const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile, 
-                                     bool tls_disable_hostname_validation)
+                                     bool tls_disable_hostname_validation, bool stop_on_disconnect,
+                                     size_t max_inbound_queue_messages, size_t max_inbound_queue_bytes,
+                                     size_t max_binary_frame_bytes)
     {
         int err; //speex
 
@@ -819,28 +1207,42 @@ namespace {
 
         memset(tech_pvt, 0, sizeof(private_t));
 
-        strncpy(tech_pvt->sessionId, switch_core_session_get_uuid(session), MAX_SESSION_ID);
-        strncpy(tech_pvt->ws_uri, wsUri, MAX_WS_URI);
+        switch_copy_string(tech_pvt->sessionId, switch_core_session_get_uuid(session), sizeof(tech_pvt->sessionId));
+        switch_copy_string(tech_pvt->ws_uri, wsUri, sizeof(tech_pvt->ws_uri));
         tech_pvt->sampling = desiredSampling;
         tech_pvt->responseHandler = responseHandler;
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
-        tech_pvt->audio_paused = 0;
+        switch_atomic_set(&tech_pvt->audio_paused, 0);
+        switch_atomic_set(&tech_pvt->close_requested, 0);
+        switch_atomic_set(&tech_pvt->cleanup_started, 0);
+        switch_atomic_set(&tech_pvt->active_stream_counted, 0);
         tech_pvt->outbound_debug = switch_channel_var_true(
             switch_core_session_get_channel(session),
             "STREAM_OUTBOUND_DEBUG"
         );
 
-        if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
+        if (metadata) {
+            switch_copy_string(tech_pvt->initialMetadata, metadata, sizeof(tech_pvt->initialMetadata));
+        }
 
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
 
-        //size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
-        const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
-        
-        if (switch_buffer_create(pool, &tech_pvt->sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
+        tech_pvt->outbound_chunk_bytes = static_cast<switch_size_t>(FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
+        tech_pvt->outbound_buffer_bytes = tech_pvt->outbound_chunk_bytes * kOutboundQueueDepthChunks;
+        tech_pvt->resample_buffer_samples = static_cast<switch_size_t>(FRAME_SIZE_8000 * desiredSampling / 8000 * channels / sizeof(spx_int16_t));
+
+        if (switch_buffer_create_dynamic(&tech_pvt->sbuffer, tech_pvt->outbound_chunk_bytes, tech_pvt->outbound_buffer_bytes, tech_pvt->outbound_buffer_bytes) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                 "%s: Error creating switch buffer.\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        tech_pvt->resample_buffer = static_cast<spx_int16_t*>(
+            switch_core_session_alloc(session, tech_pvt->resample_buffer_samples * sizeof(spx_int16_t))
+        );
+        if (!tech_pvt->resample_buffer) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "%s: Error allocating resample buffer.\n", tech_pvt->sessionId);
             return SWITCH_STATUS_FALSE;
         }
 
@@ -863,7 +1265,8 @@ namespace {
 
         auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
                                         suppressLog, tech_pvt->outbound_debug, extra_headers, tls_cafile, tls_keyfile,
-                                        tls_certfile, tls_disable_hostname_validation);
+                                        tls_certfile, tls_disable_hostname_validation, stop_on_disconnect,
+                                        max_inbound_queue_messages, max_inbound_queue_bytes, max_binary_frame_bytes);
 
         tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
 
@@ -878,6 +1281,10 @@ namespace {
             speex_resampler_destroy(tech_pvt->resampler);
             tech_pvt->resampler = nullptr;
         }
+        if (tech_pvt->sbuffer) {
+            switch_buffer_destroy(&tech_pvt->sbuffer);
+        }
+        tech_pvt->resample_buffer = nullptr;
         tech_pvt->pInboundPlayback = nullptr;
         if (tech_pvt->mutex) {
             switch_mutex_destroy(tech_pvt->mutex);
@@ -888,82 +1295,95 @@ namespace {
 }
 
 extern "C" {
-    int validate_ws_uri(const char* url, char* wsUri) {
-        const char* scheme = nullptr;
-        const char* hostStart = nullptr;
-        const char* hostEnd = nullptr;
-        const char* portStart = nullptr;
+    void stream_session_active_inc(void) {
+        switch_atomic_inc(&g_active_streams);
+    }
 
-        // Check scheme
-        if (strncmp(url, "ws://", 5) == 0) {
-            scheme = "ws";
+    void stream_session_active_dec(void) {
+        switch_atomic_dec(&g_active_streams);
+    }
+
+    uint32_t stream_session_active_count(void) {
+        return switch_atomic_read(&g_active_streams);
+    }
+
+    int validate_ws_uri(const char* url, char* wsUri) {
+        if (!url || !wsUri) {
+            return 0;
+        }
+
+        const size_t url_len = std::strlen(url);
+        if (!url_len || url_len >= MAX_WS_URI || contains_ctl_or_space(url)) {
+            return 0;
+        }
+
+        const char* hostStart = nullptr;
+        if (std::strncmp(url, "ws://", 5) == 0) {
             hostStart = url + 5;
-        } else if (strncmp(url, "wss://", 6) == 0) {
-            scheme = "wss";
+        } else if (std::strncmp(url, "wss://", 6) == 0) {
             hostStart = url + 6;
         } else {
             return 0;
         }
 
-        // Find host end or port start
-        hostEnd = hostStart;
-        while (*hostEnd && *hostEnd != ':' && *hostEnd != '/') {
-            if (!std::isalnum(*hostEnd) && *hostEnd != '-' && *hostEnd != '.') {
+        const char* cursor = hostStart;
+        if (*cursor == '[') {
+            ++cursor;
+            while (*cursor && *cursor != ']') {
+                const unsigned char c = static_cast<unsigned char>(*cursor);
+                if (!std::isxdigit(c) && c != ':' && c != '.') {
+                    return 0;
+                }
+                ++cursor;
+            }
+            if (*cursor != ']') {
                 return 0;
             }
-            ++hostEnd;
+            ++cursor;
+        } else {
+            while (*cursor && *cursor != ':' && *cursor != '/' && *cursor != '?') {
+                const unsigned char c = static_cast<unsigned char>(*cursor);
+                if (!std::isalnum(c) && c != '-' && c != '.') {
+                    return 0;
+                }
+                ++cursor;
+            }
         }
 
-        // Check if host is empty
-        if (hostStart == hostEnd) {
+        if (hostStart == cursor || (*hostStart == '[' && cursor == hostStart + 1)) {
             return 0;
         }
 
-        // Check for port
-        if (*hostEnd == ':') {
-            portStart = hostEnd + 1;
-            while (*portStart && *portStart != '/') {
-                if (!std::isdigit(*portStart)) {
+        if (*cursor == ':') {
+            ++cursor;
+            const char* port_start = cursor;
+            while (*cursor && *cursor != '/' && *cursor != '?') {
+                if (!std::isdigit(static_cast<unsigned char>(*cursor))) {
                     return 0;
                 }
-                ++portStart;
+                ++cursor;
+            }
+            if (port_start == cursor) {
+                return 0;
             }
         }
 
-        // Copy valid URI to wsUri
-        std::strncpy(wsUri, url, MAX_WS_URI);
+        switch_copy_string(wsUri, url, MAX_WS_URI);
         return 1;
     }
 
     switch_status_t is_valid_utf8(const char *str) {
-        switch_status_t status = SWITCH_STATUS_FALSE;
-        while (*str) {
-            if ((*str & 0x80) == 0x00) {
-                // 1-byte character
-                str++;
-            } else if ((*str & 0xE0) == 0xC0) {
-                // 2-byte character
-                if ((str[1] & 0xC0) != 0x80) {
-                    return status;
-                }
-                str += 2;
-            } else if ((*str & 0xF0) == 0xE0) {
-                // 3-byte character
-                if ((str[1] & 0xC0) != 0x80 || (str[2] & 0xC0) != 0x80) {
-                    return status;
-                }
-                str += 3;
-            } else if ((*str & 0xF8) == 0xF0) {
-                // 4-byte character
-                if ((str[1] & 0xC0) != 0x80 || (str[2] & 0xC0) != 0x80 || (str[3] & 0xC0) != 0x80) {
-                    return status;
-                }
-                str += 4;
-            } else {
-                // invalid character
-                return status;
-            }
+        if (!str) {
+            return SWITCH_STATUS_FALSE;
         }
+
+        Utf8Validator validator;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(str);
+        const size_t len = std::strlen(str);
+        if (!validator.validateChunk(bytes, len) || !validator.validateFinal()) {
+            return SWITCH_STATUS_FALSE;
+        }
+
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -1011,7 +1431,7 @@ extern "C" {
         if (!tech_pvt) return SWITCH_STATUS_FALSE;
 
         switch_core_media_bug_flush(bug);
-        tech_pvt->audio_paused = pause;
+        switch_atomic_set(&tech_pvt->audio_paused, pause ? 1 : 0);
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -1024,17 +1444,26 @@ extern "C" {
                                         char* metadata,
                                         void **ppUserData)
     {
-        int deflate, heart_beat;
+        int deflate = 0;
+        int heart_beat = kDefaultHeartbeatSeconds;
         bool suppressLog = false;
-        const char* buffer_size;
-        const char* extra_headers;
+        const char* extra_headers = nullptr;
         int rtp_packets = 1; //20ms burst
         const char* tls_cafile = NULL;;
         const char* tls_keyfile = NULL;;
         const char* tls_certfile = NULL;;
         bool tls_disable_hostname_validation = false;
+        bool stop_on_disconnect = true;
+        size_t max_inbound_queue_messages = kDefaultMaxInboundQueueMessages;
+        size_t max_inbound_queue_bytes = kDefaultMaxInboundQueueBytes;
+        size_t max_binary_frame_bytes = kDefaultMaxBinaryFrameBytes;
 
         switch_channel_t *channel = switch_core_session_get_channel(session);
+
+        if (metadata && std::strlen(metadata) >= MAX_METADATA_LEN) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "metadata exceeds max length of %d bytes\n", MAX_METADATA_LEN - 1);
+            return SWITCH_STATUS_FALSE;
+        }
 
         if (switch_channel_var_true(channel, "STREAM_MESSAGE_DEFLATE")) {
             deflate = 1;
@@ -1056,22 +1485,29 @@ extern "C" {
         if (heartBeat) {
             char *endptr;
             long value = strtol(heartBeat, &endptr, 10);
-            if (*endptr == '\0' && value <= INT_MAX && value >= INT_MIN) {
+            if (*endptr == '\0' && value >= 1 && value <= kMaxHeartbeatSeconds) {
                 heart_beat = (int) value;
             }
         }
 
-        if ((buffer_size = switch_channel_get_variable(channel, "STREAM_BUFFER_SIZE"))) {
-            int bSize = atoi(buffer_size);
-            if(bSize % 20 != 0) {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "%s: Buffer size of %s is not a multiple of 20ms. Using default 20ms.\n",
-                                  switch_channel_get_name(channel), buffer_size);
-            } else if(bSize >= 20){
-                rtp_packets = bSize/20;
-            }
+        const uint32_t buffer_ms = parse_ms_setting(channel, "STREAM_BUFFER_SIZE", kDefaultBufferSizeMs, kDefaultBufferSizeMs, kMaxBufferSizeMs);
+        if ((buffer_ms % 20) == 0) {
+            rtp_packets = static_cast<int>(buffer_ms / 20);
         }
 
         extra_headers = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
+        if (extra_headers && std::strlen(extra_headers) > kMaxExtraHeadersBytes) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "STREAM_EXTRA_HEADERS exceeds max length of %" SWITCH_SIZE_T_FMT " bytes\n",
+                              static_cast<switch_size_t>(kMaxExtraHeadersBytes));
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (switch_channel_get_variable(channel, "STREAM_STOP_ON_DISCONNECT")) {
+            stop_on_disconnect = switch_channel_var_true(channel, "STREAM_STOP_ON_DISCONNECT") ? true : false;
+        }
+        max_inbound_queue_messages = parse_size_setting(channel, "STREAM_MAX_INBOUND_QUEUE_MESSAGES", kDefaultMaxInboundQueueMessages, 1, 1000);
+        max_inbound_queue_bytes = parse_size_setting(channel, "STREAM_MAX_INBOUND_QUEUE_BYTES", kDefaultMaxInboundQueueBytes, 1024, 8 * 1024 * 1024);
+        max_binary_frame_bytes = parse_size_setting(channel, "STREAM_MAX_BINARY_FRAME_BYTES", kDefaultMaxBinaryFrameBytes, 512, 1024 * 1024);
 
         // allocate per-session tech_pvt
         auto* tech_pvt = (private_t *) switch_core_session_alloc(session, sizeof(private_t));
@@ -1082,7 +1518,9 @@ extern "C" {
         }
         if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, channels, 
                                                         metadata, responseHandler, deflate, heart_beat, suppressLog, rtp_packets, 
-                                                        extra_headers, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation)) {
+                                                        extra_headers, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation,
+                                                        stop_on_disconnect, max_inbound_queue_messages,
+                                                        max_inbound_queue_bytes, max_binary_frame_bytes)) {
             destroy_tech_pvt(tech_pvt);
             return SWITCH_STATUS_FALSE;
         }
@@ -1095,22 +1533,21 @@ extern "C" {
     switch_bool_t stream_frame(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) return SWITCH_TRUE;
-        if (tech_pvt->audio_paused || tech_pvt->cleanup_started) {
+        if (switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->cleanup_started)) {
             if (tech_pvt->outbound_debug) {
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
                     SWITCH_LOG_DEBUG,
                     "(%s) websocket_audio_skip paused=%d cleanup_started=%d\n",
                     tech_pvt->sessionId,
-                    tech_pvt->audio_paused,
-                    tech_pvt->cleanup_started
+                    switch_atomic_read(&tech_pvt->audio_paused),
+                    switch_atomic_read(&tech_pvt->cleanup_started)
                 );
             }
             return SWITCH_TRUE;
         }
-        
+
         std::shared_ptr<AudioStreamer> streamer;
-        std::vector<std::vector<uint8_t>> pending_send;
 
         if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
             if (tech_pvt->outbound_debug) {
@@ -1152,28 +1589,72 @@ extern "C" {
         }
 
         streamer = *sp_ptr;
+        if (!streamer || !streamer->isConnected()) {
+            if (tech_pvt->outbound_debug) {
+                switch_log_printf(
+                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
+                    SWITCH_LOG_DEBUG,
+                    "(%s) websocket_audio_skip reason=not_connected\n",
+                    tech_pvt->sessionId
+                );
+            }
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_TRUE;
+        }
 
         auto *resampler = tech_pvt->resampler;
         const int channels = tech_pvt->channels;
-        const int rtp_packets = tech_pvt->rtp_packets;
         if (tech_pvt->outbound_debug) {
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
                 SWITCH_LOG_DEBUG,
                 "(%s) stream_frame_enter connected=%s resampler=%s channels=%d rtp_packets=%d\n",
                 tech_pvt->sessionId,
-                streamer && streamer->isConnected() ? "true" : "false",
+                "true",
                 resampler ? "true" : "false",
                 channels,
-                rtp_packets
+                tech_pvt->rtp_packets
             );
         }
 
         switch_size_t frames_read = 0;
         switch_size_t bytes_captured = 0;
+        switch_size_t bytes_dropped = 0;
+        switch_size_t bytes_queued = 0;
+        uint8_t discard_buf[1024];
+        auto drop_oldest = [&](switch_size_t needed) {
+            while (needed > 0 && switch_buffer_inuse(tech_pvt->sbuffer) > 0) {
+                const switch_size_t chunk = needed > sizeof(discard_buf) ? sizeof(discard_buf) : needed;
+                const switch_size_t dropped = switch_buffer_read(tech_pvt->sbuffer, discard_buf, chunk);
+                if (!dropped) {
+                    break;
+                }
+                bytes_dropped += dropped;
+                needed -= dropped;
+            }
+        };
+
+        auto queue_audio = [&](const uint8_t* data, switch_size_t len) {
+            if (!data || !len || !tech_pvt->sbuffer) {
+                return;
+            }
+
+            if (len > tech_pvt->outbound_buffer_bytes) {
+                data += (len - tech_pvt->outbound_buffer_bytes);
+                bytes_dropped += (len - tech_pvt->outbound_buffer_bytes);
+                len = tech_pvt->outbound_buffer_bytes;
+            }
+
+            const switch_size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
+            if (len > freespace) {
+                drop_oldest(len - freespace);
+            }
+
+            switch_buffer_write(tech_pvt->sbuffer, data, len);
+            bytes_queued += len;
+        };
 
         if (nullptr == resampler) {
-            
             uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
             switch_frame_t frame = {};
             frame.data = data_buf;
@@ -1185,31 +1666,9 @@ extern "C" {
                 }
                 frames_read += 1;
                 bytes_captured += static_cast<switch_size_t>(frame.datalen);
-
-                if (rtp_packets == 1) {
-                    pending_send.emplace_back((uint8_t*)frame.data, (uint8_t*)frame.data + frame.datalen);
-                    continue;
-                }
-
-                size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
-                
-                if (freespace >= frame.datalen) {
-                    switch_buffer_write(tech_pvt->sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
-                }
-
-                if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
-                    if (inuse > 0) {
-                        std::vector<uint8_t> tmp(inuse);
-                        switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                        switch_buffer_zero(tech_pvt->sbuffer);
-                        pending_send.emplace_back(std::move(tmp));
-                    }
-                }
+                queue_audio(static_cast<const uint8_t *>(frame.data), frame.datalen);
             }
-            
         } else {
-
             uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
             switch_frame_t frame = {};
             frame.data = data;
@@ -1221,109 +1680,56 @@ extern "C" {
                 }
                 frames_read += 1;
 
-                const size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
                 spx_uint32_t in_len = frame.samples;
-                spx_uint32_t out_len = (freespace / (tech_pvt->channels * sizeof(spx_int16_t)));
-                
-                if(out_len == 0) {
-                    if(freespace == 0) {
-                        switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
-                        if (inuse > 0) {
-                            std::vector<uint8_t> tmp(inuse);
-                            switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                            switch_buffer_zero(tech_pvt->sbuffer);
-                            pending_send.emplace_back(std::move(tmp));
-                        }
-                    }
-                    continue;
-                }
-
-                std::vector<spx_int16_t> out;
-                out.resize((size_t)out_len * (size_t)channels);
+                spx_uint32_t out_len = static_cast<spx_uint32_t>(tech_pvt->resample_buffer_samples / static_cast<switch_size_t>(channels));
 
                 if(channels == 1) {
                     speex_resampler_process_int(resampler,
                                     0,
                                     (const spx_int16_t *)frame.data,
                                     &in_len,
-                                    out.data(),
+                                    tech_pvt->resample_buffer,
                                     &out_len);
                 } else {
                     speex_resampler_process_interleaved_int(resampler,
                                     (const spx_int16_t *)frame.data,
                                     &in_len,
-                                    out.data(),
+                                    tech_pvt->resample_buffer,
                                     &out_len);
                 }
 
                 if(out_len > 0) {
                     const size_t bytes_written = (size_t)out_len * (size_t)channels * sizeof(spx_int16_t);
                     bytes_captured += static_cast<switch_size_t>(bytes_written);
-
-                    if (rtp_packets == 1) { //20ms packet
-                        const uint8_t* p = (const uint8_t*)out.data();
-                        pending_send.emplace_back(p, p + bytes_written);
-                        continue;
-                    }
-
-                    if (bytes_written <= switch_buffer_freespace(tech_pvt->sbuffer)) {
-                        switch_buffer_write(tech_pvt->sbuffer, (const uint8_t *)out.data(), bytes_written);
-                    }
-                }
-
-                if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
-                    if (inuse > 0) {
-                        std::vector<uint8_t> tmp(inuse);
-                        switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                        switch_buffer_zero(tech_pvt->sbuffer);
-                        pending_send.emplace_back(std::move(tmp));
-                    }
+                    queue_audio(reinterpret_cast<const uint8_t *>(tech_pvt->resample_buffer), static_cast<switch_size_t>(bytes_written));
                 }
             }
         }
-        
+
         switch_mutex_unlock(tech_pvt->mutex);
         if (tech_pvt->outbound_debug) {
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
                 SWITCH_LOG_DEBUG,
-                "(%s) stream_frame_capture_result frames=%" SWITCH_SIZE_T_FMT " captured_bytes=%" SWITCH_SIZE_T_FMT " queued_chunks=%" SWITCH_SIZE_T_FMT "\n",
+                "(%s) stream_frame_capture_result frames=%" SWITCH_SIZE_T_FMT " captured_bytes=%" SWITCH_SIZE_T_FMT " queued_bytes=%" SWITCH_SIZE_T_FMT " dropped_bytes=%" SWITCH_SIZE_T_FMT "\n",
                 tech_pvt->sessionId,
                 frames_read,
                 bytes_captured,
-                static_cast<switch_size_t>(pending_send.size())
+                bytes_queued,
+                bytes_dropped
             );
         }
-    
-        if (!streamer || !streamer->isConnected()) {
-            if (tech_pvt->outbound_debug) {
-                switch_log_printf(
-                    SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
-                    SWITCH_LOG_DEBUG,
-                    "(%s) websocket_audio_skip reason=not_connected queued_chunks=%" SWITCH_SIZE_T_FMT "\n",
-                    tech_pvt->sessionId,
-                    static_cast<switch_size_t>(pending_send.size())
-                );
-            }
-            return SWITCH_TRUE;
-        }
 
-        switch_size_t total_bytes = 0;
-        for (auto &chunk : pending_send) {
-            if (!chunk.empty()) {
-                total_bytes += static_cast<switch_size_t>(chunk.size());
-                streamer->writeBinary(chunk.data(), chunk.size());
-            }
+        if (bytes_queued > 0 && streamer) {
+            streamer->notifyOutboundData();
         }
-        if (tech_pvt->outbound_debug && !pending_send.empty()) {
+        if (tech_pvt->outbound_debug && bytes_dropped > 0) {
             switch_log_printf(
                 SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)),
-                SWITCH_LOG_DEBUG,
-                "(%s) websocket_audio_flush chunks=%" SWITCH_SIZE_T_FMT " bytes=%" SWITCH_SIZE_T_FMT "\n",
+                SWITCH_LOG_WARNING,
+                "(%s) outbound queue dropped %" SWITCH_SIZE_T_FMT " bytes to keep latency bounded\n",
                 tech_pvt->sessionId,
-                static_cast<switch_size_t>(pending_send.size()),
-                total_bytes
+                bytes_dropped
             );
         }
 
@@ -1344,11 +1750,11 @@ extern "C" {
 
             switch_mutex_lock(tech_pvt->mutex);
 
-            if (tech_pvt->cleanup_started) {
+            if (switch_atomic_read(&tech_pvt->cleanup_started)) {
                 switch_mutex_unlock(tech_pvt->mutex);
                 return SWITCH_STATUS_SUCCESS;
             }
-            tech_pvt->cleanup_started = 1;
+            switch_atomic_set(&tech_pvt->cleanup_started, 1);
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
 
@@ -1381,6 +1787,10 @@ extern "C" {
             }
 
             inbound_playback_session_cleanup(session, tech_pvt);
+            if (switch_atomic_read(&tech_pvt->active_stream_counted)) {
+                switch_atomic_set(&tech_pvt->active_stream_counted, 0);
+                stream_session_active_dec();
+            }
             destroy_tech_pvt(tech_pvt);
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);

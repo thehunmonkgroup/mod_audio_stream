@@ -33,13 +33,18 @@ struct private_data {
     char ws_uri[MAX_WS_URI];
     int sampling;
     int channels;
-    int audio_paused:1;
-    int close_requested:1;
-    int cleanup_started:1;
-    int outbound_debug:1;
+    volatile switch_atomic_t audio_paused;
+    volatile switch_atomic_t close_requested;
+    volatile switch_atomic_t cleanup_started;
+    volatile switch_atomic_t active_stream_counted;
+    switch_size_t outbound_chunk_bytes;
+    switch_size_t outbound_buffer_bytes;
+    int outbound_debug;
     char initialMetadata[8192];
     switch_buffer_t *sbuffer;
     int rtp_packets;
+    spx_int16_t *resample_buffer;
+    switch_size_t resample_buffer_samples;
 };
 
 typedef struct private_data private_t;
