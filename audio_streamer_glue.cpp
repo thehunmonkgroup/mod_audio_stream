@@ -1017,9 +1017,7 @@ private:
                 "(%s) received streamAudioEnd\n",
                 tech_pvt->sessionId
             );
-            if (inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id)) != SWITCH_STATUS_SUCCESS) {
-                emitProtocolError(session, tech_pvt, 4411, "streamAudioEnd without active playback");
-            }
+            (void) inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id));
             emitControlEvent(
                 session,
                 tech_pvt,
@@ -1037,9 +1035,7 @@ private:
                 "(%s) received streamAudioCancel\n",
                 tech_pvt->sessionId
             );
-            if (inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id)) != SWITCH_STATUS_SUCCESS) {
-                emitProtocolError(session, tech_pvt, 4412, "streamAudioCancel without active playback");
-            }
+            (void) inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id));
             emitControlEvent(
                 session,
                 tech_pvt,

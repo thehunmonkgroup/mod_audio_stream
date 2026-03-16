@@ -219,6 +219,19 @@ size_t bytes_for_ms(uint32_t rate, uint32_t channels, uint32_t ms) {
     return static_cast<size_t>(total / 1000);
 }
 
+uint32_t ms_for_bytes(uint32_t rate, uint32_t channels, size_t bytes) {
+    const uint64_t bytes_per_second =
+        static_cast<uint64_t>(rate) *
+        static_cast<uint64_t>(channels) *
+        static_cast<uint64_t>(sizeof(int16_t));
+
+    if (bytes_per_second == 0 || bytes == 0) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>((static_cast<uint64_t>(bytes) * 1000) / bytes_per_second);
+}
+
 const char *playback_state_name(PlaybackState state) {
     switch (state) {
         case PlaybackState::Idle:
@@ -439,6 +452,17 @@ void reset_playback_metrics(InboundPlaybackState *state) {
     state->playback_start_emitted = false;
 }
 
+void clear_active_playback_fields(InboundPlaybackState *state) {
+    if (!state) {
+        return;
+    }
+
+    state->current_playback_id.clear();
+    state->source_rate = 0;
+    state->source_channels = 0;
+    state->playback_start_emitted = false;
+}
+
 void finalize_active_window(InboundPlaybackState *state) {
     if (!state) {
         return;
@@ -447,6 +471,7 @@ void finalize_active_window(InboundPlaybackState *state) {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (!state->closed && playback_state_is_active(state->state)) {
         state->state = PlaybackState::Idle;
+        clear_active_playback_fields(state);
     }
 }
 
@@ -495,8 +520,7 @@ switch_status_t write_next_frame(switch_core_session_t *session, InboundPlayback
             if (state->state == PlaybackState::Draining) {
                 playback_complete_id = state->current_playback_id;
                 state->state = PlaybackState::Idle;
-                state->current_playback_id.clear();
-                state->playback_start_emitted = false;
+                clear_active_playback_fields(state);
                 should_log_completion = true;
             }
         } else {
@@ -936,7 +960,7 @@ switch_status_t inbound_playback_start(
 
         if (configure_resampler(state.get()) != SWITCH_STATUS_SUCCESS) {
             state->state = PlaybackState::Idle;
-            state->current_playback_id.clear();
+            clear_active_playback_fields(state.get());
             return SWITCH_STATUS_FALSE;
         }
     }
@@ -973,8 +997,12 @@ switch_status_t inbound_playback_end(
     }
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->state == PlaybackState::Idle || state->state == PlaybackState::Closed) {
-        return SWITCH_STATUS_FALSE;
+    if (
+        state->state == PlaybackState::Idle
+        || state->state == PlaybackState::Closed
+        || state->current_playback_id.empty()
+    ) {
+        return SWITCH_STATUS_SUCCESS;
     }
 
     copy_string_to_buffer(state->current_playback_id, playback_id, playback_id_len);
@@ -1002,7 +1030,7 @@ switch_status_t inbound_playback_cancel(
     size_t playback_id_len
 ) {
     auto state = get_state_shared(tech_pvt);
-    if (!state) {
+    if (!session || !state) {
         return SWITCH_STATUS_FALSE;
     }
 
@@ -1010,6 +1038,13 @@ switch_status_t inbound_playback_cancel(
 
     {
         std::lock_guard<std::mutex> lock(state->mutex);
+        if (
+            !playback_state_is_active(state->state)
+            || state->current_playback_id.empty()
+        ) {
+            return SWITCH_STATUS_SUCCESS;
+        }
+
         cancelled_playback_id = state->current_playback_id;
         copy_string_to_buffer(
             cancelled_playback_id, playback_id, playback_id_len
@@ -1018,8 +1053,7 @@ switch_status_t inbound_playback_cancel(
         state->buffer.clear();
         state->pending_input.clear();
         state->state = PlaybackState::Idle;
-        state->current_playback_id.clear();
-        state->playback_start_emitted = false;
+        clear_active_playback_fields(state.get());
 
         if (state->debug_enabled) {
             switch_log_printf(
@@ -1033,14 +1067,99 @@ switch_status_t inbound_playback_cancel(
     }
 
     state->cond.notify_one();
-    emit_playback_event(
-        state.get(),
-        session,
-        EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED,
-        "streamAudioPlaybackCancelled",
-        cancelled_playback_id
-    );
+    if (!cancelled_playback_id.empty()) {
+        emit_playback_event(
+            state.get(),
+            session,
+            EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED,
+            "streamAudioPlaybackCancelled",
+            cancelled_playback_id
+        );
+    }
 
+    return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t inbound_playback_get_status_json(
+    private_t *tech_pvt,
+    char *json,
+    size_t json_len
+) {
+    auto state = get_state_shared(tech_pvt);
+    if (!state || !json || json_len == 0) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    std::string playback_id;
+    const char *state_name = "unknown";
+    switch_bool_t active = SWITCH_FALSE;
+    size_t buffered_bytes = 0;
+    size_t max_buffer_bytes = 0;
+    size_t preroll_bytes = 0;
+    uint32_t buffered_ms = 0;
+    uint32_t target_rate = 0;
+    uint32_t target_channels = 0;
+    uint32_t source_rate = 0;
+    uint32_t source_channels = 0;
+    uint64_t generation = 0;
+    uint64_t total_input_bytes = 0;
+    uint64_t total_output_bytes = 0;
+    uint64_t overflow_events = 0;
+    uint64_t dropped_output_bytes = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        playback_id = state->current_playback_id;
+        state_name = playback_state_name(state->state);
+        active = playback_state_is_active(state->state) ? SWITCH_TRUE : SWITCH_FALSE;
+        buffered_bytes = state->buffer.size();
+        max_buffer_bytes = state->max_buffer_bytes;
+        preroll_bytes = state->preroll_bytes;
+        target_rate = state->target_rate;
+        target_channels = state->target_channels;
+        source_rate = state->source_rate;
+        source_channels = state->source_channels;
+        generation = state->generation;
+        total_input_bytes = state->total_input_bytes;
+        total_output_bytes = state->total_output_bytes;
+        overflow_events = state->overflow_events;
+        dropped_output_bytes = state->dropped_output_bytes;
+    }
+
+    buffered_ms = ms_for_bytes(target_rate, target_channels, buffered_bytes);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    cJSON_AddBoolToObject(root, "active", active == SWITCH_TRUE);
+    cJSON_AddStringToObject(root, "state", state_name);
+    if (!playback_id.empty()) {
+        cJSON_AddStringToObject(root, "playbackId", playback_id.c_str());
+    }
+    cJSON_AddNumberToObject(root, "bufferedBytes", static_cast<double>(buffered_bytes));
+    cJSON_AddNumberToObject(root, "bufferedMs", buffered_ms);
+    cJSON_AddNumberToObject(root, "maxBufferBytes", static_cast<double>(max_buffer_bytes));
+    cJSON_AddNumberToObject(root, "prerollBytes", static_cast<double>(preroll_bytes));
+    cJSON_AddNumberToObject(root, "targetRate", target_rate);
+    cJSON_AddNumberToObject(root, "targetChannels", target_channels);
+    cJSON_AddNumberToObject(root, "sourceRate", source_rate);
+    cJSON_AddNumberToObject(root, "sourceChannels", source_channels);
+    cJSON_AddNumberToObject(root, "generation", static_cast<double>(generation));
+    cJSON_AddNumberToObject(root, "totalInputBytes", static_cast<double>(total_input_bytes));
+    cJSON_AddNumberToObject(root, "totalOutputBytes", static_cast<double>(total_output_bytes));
+    cJSON_AddNumberToObject(root, "overflowEvents", static_cast<double>(overflow_events));
+    cJSON_AddNumberToObject(root, "droppedOutputBytes", static_cast<double>(dropped_output_bytes));
+
+    char *rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!rendered) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    copy_string_to_buffer(rendered, json, json_len);
+    switch_safe_free(rendered);
     return SWITCH_STATUS_SUCCESS;
 }
 

@@ -30,6 +30,11 @@ switch_status_t inbound_playback_cancel(
     char *playback_id,
     size_t playback_id_len
 );
+switch_status_t inbound_playback_get_status_json(
+    private_t *tech_pvt,
+    char *json,
+    size_t json_len
+);
 switch_status_t inbound_playback_append(private_t *tech_pvt, const void *data, size_t len);
 switch_status_t inbound_playback_tick(switch_core_session_t *session, private_t *tech_pvt);
 

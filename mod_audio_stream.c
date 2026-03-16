@@ -161,6 +161,7 @@ static switch_status_t do_playback_stop(switch_core_session_t *session) {
     switch_status_t status = SWITCH_STATUS_FALSE;
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
+    char playback_id[512] = "";
 
     if (!bug) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed playback_stop.\n");
@@ -173,18 +174,85 @@ static switch_status_t do_playback_stop(switch_core_session_t *session) {
         return status;
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_stop\n");
-    status = inbound_playback_cancel(session, tech_pvt, NULL, 0);
+    status = inbound_playback_cancel(session, tech_pvt, playback_id, sizeof(playback_id));
+    if (status == SWITCH_STATUS_SUCCESS) {
+        if (playback_id[0]) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_stop playback_id=%s\n", playback_id);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_stop no-op\n");
+        }
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no active inbound playback, failed playback_stop.\n");
+    }
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | playback_stop | send_text | pause | resume ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+static switch_status_t do_playback_end(switch_core_session_t *session) {
+    switch_status_t status = SWITCH_STATUS_FALSE;
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
+    char playback_id[512] = "";
+
+    if (!bug) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed playback_end.\n");
+        return status;
+    }
+
+    private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
+    if (!tech_pvt) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no private data, failed playback_end.\n");
+        return status;
+    }
+
+    status = inbound_playback_end(tech_pvt, playback_id, sizeof(playback_id));
+    if (status == SWITCH_STATUS_SUCCESS) {
+        if (playback_id[0]) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_end playback_id=%s\n", playback_id);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: playback_end no-op\n");
+        }
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no active inbound playback, failed playback_end.\n");
+    }
+    return status;
+}
+
+static switch_status_t do_playback_status(
+    switch_core_session_t *session,
+    char *json,
+    size_t json_len
+) {
+    switch_status_t status = SWITCH_STATUS_FALSE;
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
+
+    if (!bug) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no bug, failed playback_status.\n");
+        return status;
+    }
+
+    private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
+    if (!tech_pvt) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no private data, failed playback_status.\n");
+        return status;
+    }
+
+    status = inbound_playback_get_status_json(tech_pvt, json, json_len);
+    if (status != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: failed playback_status.\n");
+    }
+    return status;
+}
+
+#define STREAM_API_SYNTAX "<uuid> [start | stop | playback_stop | playback_end | playback_status | send_text | pause | resume ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
     int argc = 0;
 
     switch_status_t status = SWITCH_STATUS_FALSE;
+    char status_json[2048] = "";
+    switch_bool_t has_custom_response = SWITCH_FALSE;
 
     if (!zstr(cmd) && (mycmd = strdup(cmd))) {
         argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
@@ -209,6 +277,13 @@ SWITCH_STANDARD_API(stream_function)
                 status = do_stop(lsession, argc > 2 ? argv[2] : NULL);
             } else if (!strcasecmp(argv[1], "playback_stop")) {
                 status = do_playback_stop(lsession);
+            } else if (!strcasecmp(argv[1], "playback_end")) {
+                status = do_playback_end(lsession);
+            } else if (!strcasecmp(argv[1], "playback_status")) {
+                status = do_playback_status(lsession, status_json, sizeof(status_json));
+                if (status == SWITCH_STATUS_SUCCESS) {
+                    has_custom_response = SWITCH_TRUE;
+                }
             } else if (!strcasecmp(argv[1], "pause")) {
                 status = do_pauseresume(lsession, 1);
             } else if (!strcasecmp(argv[1], "resume")) {
@@ -280,7 +355,11 @@ SWITCH_STANDARD_API(stream_function)
     }
 
     if (status == SWITCH_STATUS_SUCCESS) {
-        stream->write_function(stream, "+OK Success\n");
+        if (has_custom_response) {
+            stream->write_function(stream, "+OK %s\n", status_json);
+        } else {
+            stream->write_function(stream, "+OK Success\n");
+        }
     } else {
         stream->write_function(stream, "-ERR Operation Failed\n");
     }
@@ -320,6 +399,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid stop");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid playback_stop");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid playback_end");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid playback_status");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid pause");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid resume");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid send_text");
