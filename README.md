@@ -158,7 +158,8 @@ Resumes audio stream
 
 ## Threading And Resource Model
 
-- Each session currently uses one inbound websocket worker thread and one inbound playback playout thread.
+- Inbound websocket queue processing runs on a shared worker pool keyed by session id, while each session keeps its own bounded inbound queue and in-order message handling.
+- Each session currently still uses one inbound playback playout thread.
 - Outbound audio capture happens in the media-bug callback, but websocket sending is moved onto an internal sender worker so the callback does not call websocket send directly.
 - Outbound websocket audio is buffered in a bounded in-memory queue with drop-oldest behavior to keep latency bounded under congestion.
 - Inbound websocket messages are queued behind explicit message/byte caps. Overflow is treated as a protocol/backpressure failure and disconnects the websocket.

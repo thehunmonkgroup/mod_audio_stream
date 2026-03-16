@@ -247,7 +247,36 @@ bool write_all_fd(int fd, const uint8_t* data, size_t len) {
 
 }  // namespace
 
-class AudioStreamer {
+class AudioStreamer;
+
+namespace {
+
+constexpr size_t kInboundWorkerPoolMinThreads = 2;
+constexpr size_t kInboundWorkerPoolMaxThreads = 8;
+constexpr size_t kInboundWorkBatchMessages = 8;
+
+class InboundWorkPool {
+public:
+    InboundWorkPool();
+    ~InboundWorkPool();
+
+    void submit(const std::shared_ptr<AudioStreamer>& streamer);
+
+private:
+    void workerLoop();
+
+    std::mutex m_mutex;
+    std::condition_variable m_cond;
+    std::deque<std::weak_ptr<AudioStreamer> > m_tasks;
+    std::vector<std::thread> m_workers;
+    bool m_stopping = false;
+};
+
+InboundWorkPool& inboundWorkPool();
+
+}  // namespace
+
+class AudioStreamer : public std::enable_shared_from_this<AudioStreamer> {
 public:
     // Factory
     static std::shared_ptr<AudioStreamer> create(
@@ -346,6 +375,54 @@ public:
         return m_cleanedUp.load(std::memory_order_acquire);
     }
 
+    void runInboundWorkItem() {
+        try {
+            std::vector<InboundMessage> batch;
+
+            {
+                std::lock_guard<std::mutex> lock(m_inboundMutex);
+                if (m_stopInboundWorker || m_inboundQueue.empty()) {
+                    m_inboundTaskScheduled = false;
+                    return;
+                }
+
+                const size_t batch_size = std::min(kInboundWorkBatchMessages, m_inboundQueue.size());
+                batch.reserve(batch_size);
+
+                for (size_t i = 0; i < batch_size; ++i) {
+                    InboundMessage message = std::move(m_inboundQueue.front());
+                    if (message.type == InboundMessageType::Text) {
+                        m_inboundQueueBytes -= message.text.size();
+                    } else {
+                        m_inboundQueueBytes -= message.binary.size();
+                    }
+                    m_inboundQueue.pop_front();
+                    batch.push_back(std::move(message));
+                }
+            }
+
+            for (std::vector<InboundMessage>::const_iterator it = batch.begin(); it != batch.end(); ++it) {
+                processInboundMessage(*it);
+            }
+
+            std::shared_ptr<AudioStreamer> self;
+            {
+                std::lock_guard<std::mutex> lock(m_inboundMutex);
+                if (m_stopInboundWorker || m_inboundQueue.empty()) {
+                    m_inboundTaskScheduled = false;
+                    return;
+                }
+                self = shared_from_this();
+            }
+
+            inboundWorkPool().submit(self);
+        } catch (const std::exception& e) {
+            emitErrorAndDisconnect(4505, "inbound_worker_exception", e.what());
+        } catch (...) {
+            emitErrorAndDisconnect(4505, "inbound_worker_exception");
+        }
+    }
+
 private:
     // Ctor
     AudioStreamer(
@@ -421,7 +498,6 @@ private:
         if(!hdrs.empty())
             client.setHeaders(hdrs);
 
-        m_inboundWorker = std::thread(&AudioStreamer::processInboundQueue, this);
         m_outboundWorker = std::thread(&AudioStreamer::processOutboundQueue, this);
     }
 
@@ -589,22 +665,36 @@ private:
     }
 
     void enqueueText(const std::string& message) {
+        bool should_submit = false;
+        bool overflowed = false;
+
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
-            if (m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.size()) > m_maxInboundQueueBytes) {
+            if (m_stopInboundWorker) {
+                return;
+            }
+
+            if (m_inboundOverflowed || m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.size()) > m_maxInboundQueueBytes) {
                 m_inboundOverflowed = true;
+                overflowed = true;
             } else {
                 m_inboundQueueBytes += message.size();
                 m_inboundQueue.push_back(InboundMessage{InboundMessageType::Text, message, {}});
+                if (!m_inboundTaskScheduled) {
+                    m_inboundTaskScheduled = true;
+                    should_submit = true;
+                }
             }
         }
 
-        if (m_inboundOverflowed) {
+        if (overflowed) {
             emitErrorAndDisconnect(4408, "inbound_queue_overflow", "text queue limit exceeded");
             return;
         }
 
-        m_inboundCond.notify_one();
+        if (should_submit) {
+            inboundWorkPool().submit(shared_from_this());
+        }
     }
 
     void enqueueBinary(const void* data, size_t len) {
@@ -617,43 +707,48 @@ private:
             return;
         }
 
+        bool should_submit = false;
+        bool overflowed = false;
         InboundMessage message;
         message.type = InboundMessageType::Binary;
         message.binary.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + len);
 
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
-            if (m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.binary.size()) > m_maxInboundQueueBytes) {
+            if (m_stopInboundWorker) {
+                return;
+            }
+
+            if (m_inboundOverflowed || m_inboundQueue.size() >= m_maxInboundQueueMessages || (m_inboundQueueBytes + message.binary.size()) > m_maxInboundQueueBytes) {
                 m_inboundOverflowed = true;
+                overflowed = true;
             } else {
                 m_inboundQueueBytes += message.binary.size();
                 m_inboundQueue.push_back(std::move(message));
+                if (!m_inboundTaskScheduled) {
+                    m_inboundTaskScheduled = true;
+                    should_submit = true;
+                }
             }
         }
 
-        if (m_inboundOverflowed) {
+        if (overflowed) {
             emitErrorAndDisconnect(4408, "inbound_queue_overflow", "binary queue limit exceeded");
             return;
         }
 
-        m_inboundCond.notify_one();
+        if (should_submit) {
+            inboundWorkPool().submit(shared_from_this());
+        }
     }
 
     void stopWorkers() {
         {
             std::lock_guard<std::mutex> lock(m_inboundMutex);
             m_stopInboundWorker = true;
+            m_inboundTaskScheduled = false;
             m_inboundQueueBytes = 0;
             m_inboundQueue.clear();
-        }
-        m_inboundCond.notify_all();
-
-        if (m_inboundWorker.joinable()) {
-            if (m_inboundWorker.get_id() == std::this_thread::get_id()) {
-                m_inboundWorker.detach();
-            } else {
-                m_inboundWorker.join();
-            }
         }
 
         {
@@ -681,54 +776,25 @@ private:
         return static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
     }
 
-    void processInboundQueue() {
-        try {
-            while (true) {
-                InboundMessage message;
-
-                {
-                    std::unique_lock<std::mutex> lock(m_inboundMutex);
-                    m_inboundCond.wait(lock, [this]() {
-                        return m_stopInboundWorker || !m_inboundQueue.empty();
-                    });
-
-                    if (m_stopInboundWorker && m_inboundQueue.empty()) {
-                        return;
-                    }
-
-                    message = std::move(m_inboundQueue.front());
-                    if (message.type == InboundMessageType::Text) {
-                        m_inboundQueueBytes -= message.text.size();
-                    } else {
-                        m_inboundQueueBytes -= message.binary.size();
-                    }
-                    m_inboundQueue.pop_front();
-                }
-
-                switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
-                if (!psession) {
-                    continue;
-                }
-
-                auto *tech_pvt = get_private_data(psession);
-                if (!tech_pvt) {
-                    switch_core_session_rwunlock(psession);
-                    continue;
-                }
-
-                if (message.type == InboundMessageType::Text) {
-                    processQueuedText(psession, tech_pvt, message.text);
-                } else {
-                    processQueuedBinary(psession, tech_pvt, message.binary);
-                }
-
-                switch_core_session_rwunlock(psession);
-            }
-        } catch (const std::exception& e) {
-            emitErrorAndDisconnect(4505, "inbound_worker_exception", e.what());
-        } catch (...) {
-            emitErrorAndDisconnect(4505, "inbound_worker_exception");
+    void processInboundMessage(const InboundMessage& message) {
+        switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+        if (!psession) {
+            return;
         }
+
+        auto *tech_pvt = get_private_data(psession);
+        if (!tech_pvt) {
+            switch_core_session_rwunlock(psession);
+            return;
+        }
+
+        if (message.type == InboundMessageType::Text) {
+            processQueuedText(psession, tech_pvt, message.text);
+        } else {
+            processQueuedBinary(psession, tech_pvt, message.binary);
+        }
+
+        switch_core_session_rwunlock(psession);
     }
 
     void processOutboundQueue() {
@@ -1237,10 +1303,9 @@ private:
     std::atomic<bool> m_cleanedUp{false};
     std::mutex m_stateMutex;
     std::mutex m_inboundMutex;
-    std::condition_variable m_inboundCond;
     std::deque<InboundMessage> m_inboundQueue;
-    std::thread m_inboundWorker;
     bool m_stopInboundWorker = false;
+    bool m_inboundTaskScheduled = false;
     bool m_inboundOverflowed = false;
     size_t m_inboundQueueBytes = 0;
     std::mutex m_outboundMutex;
@@ -1249,6 +1314,91 @@ private:
     bool m_stopOutboundWorker = false;
     bool m_outboundPending = false;
 };
+
+namespace {
+
+InboundWorkPool::InboundWorkPool() {
+    unsigned int worker_count = std::thread::hardware_concurrency();
+    if (worker_count == 0) {
+        worker_count = static_cast<unsigned int>(kInboundWorkerPoolMinThreads);
+    }
+    worker_count = std::max<unsigned int>(
+        static_cast<unsigned int>(kInboundWorkerPoolMinThreads),
+        std::min<unsigned int>(
+            worker_count,
+            static_cast<unsigned int>(kInboundWorkerPoolMaxThreads)
+        )
+    );
+
+    m_workers.reserve(worker_count);
+    for (unsigned int i = 0; i < worker_count; ++i) {
+        m_workers.push_back(std::thread(&InboundWorkPool::workerLoop, this));
+    }
+}
+
+InboundWorkPool::~InboundWorkPool() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_stopping = true;
+    }
+    m_cond.notify_all();
+
+    for (std::vector<std::thread>::iterator it = m_workers.begin(); it != m_workers.end(); ++it) {
+        if (it->joinable()) {
+            it->join();
+        }
+    }
+}
+
+void InboundWorkPool::submit(const std::shared_ptr<AudioStreamer>& streamer) {
+    if (!streamer) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_stopping) {
+            return;
+        }
+        m_tasks.push_back(streamer);
+    }
+
+    m_cond.notify_one();
+}
+
+void InboundWorkPool::workerLoop() {
+    while (true) {
+        std::weak_ptr<AudioStreamer> task;
+
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cond.wait(lock, [this]() {
+                return m_stopping || !m_tasks.empty();
+            });
+
+            if (m_stopping && m_tasks.empty()) {
+                return;
+            }
+
+            task = m_tasks.front();
+            m_tasks.pop_front();
+        }
+
+        std::shared_ptr<AudioStreamer> streamer = task.lock();
+        if (!streamer) {
+            continue;
+        }
+
+        streamer->runInboundWorkItem();
+    }
+}
+
+InboundWorkPool& inboundWorkPool() {
+    static InboundWorkPool pool;
+    return pool;
+}
+
+}  // namespace
 
 
 namespace {
