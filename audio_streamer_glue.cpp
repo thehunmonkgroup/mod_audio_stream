@@ -1,11 +1,11 @@
 #include <string>
 #include <cstring>
+#include <cerrno>
 #include "mod_audio_stream.h"
 #include "inbound_playback.h"
 #include "WebSocketClient.h"
 #include "Utf8Validator.h"
 #include <switch_json.h>
-#include <fstream>
 #include <switch_buffer.h>
 #include <unordered_set>
 #include <atomic>
@@ -18,6 +18,7 @@
 #include <cctype>
 #include <climits>
 #include <cstdio>
+#include <unistd.h>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -177,6 +178,71 @@ std::string build_error_json(int code, const char* error, const char* detail = n
     cJSON_Delete(root);
     switch_safe_free(json);
     return payload;
+}
+
+struct ScopedTempFile {
+    int fd = -1;
+    std::string path;
+    bool keep = false;
+
+    ~ScopedTempFile() {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        if (!keep && !path.empty()) {
+            ::unlink(path.c_str());
+        }
+    }
+};
+
+bool create_scoped_temp_file(const std::string& session_id, const std::string& suffix, ScopedTempFile& out, std::string& error) {
+    if (suffix.empty()) {
+        error = "missing suffix";
+        return false;
+    }
+
+    char file_template[512];
+    const int written = switch_snprintf(
+        file_template,
+        sizeof(file_template),
+        "%s%s%s_XXXXXX%s",
+        SWITCH_GLOBAL_dirs.temp_dir,
+        SWITCH_PATH_SEPARATOR,
+        session_id.c_str(),
+        suffix.c_str()
+    );
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(file_template)) {
+        error = "temp file path too long";
+        return false;
+    }
+
+    const int fd = mkstemps(file_template, static_cast<int>(suffix.size()));
+    if (fd < 0) {
+        error = std::string("mkstemps failed: ") + std::strerror(errno);
+        return false;
+    }
+
+    out.fd = fd;
+    out.path.assign(file_template);
+    return true;
+}
+
+bool write_all_fd(int fd, const uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        const ssize_t written = ::write(fd, data + offset, len - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (written == 0) {
+            return false;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    return true;
 }
 
 }  // namespace
@@ -1112,39 +1178,34 @@ private:
             return out;
         }
 
-        // reserve file index
-        int idx = 0;
-        {
-            std::lock_guard<std::mutex> lk(m_stateMutex);
-            idx = m_playFile++;
+        ScopedTempFile temp_file;
+        std::string temp_file_error;
+        if (!create_scoped_temp_file(m_sessionId, fileType, temp_file, temp_file_error)) {
+            push_err(out, m_sessionId, "processMessage - failed to create temp file: " + temp_file_error);
+            return out;
         }
 
-        char filePath[256];
-        switch_snprintf(filePath, sizeof(filePath), "%s%s%s_%d.tmp%s",
-                        SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR,
-                        m_sessionId.c_str(), idx, fileType.c_str());
-
-        // write file
-        {
-            std::ofstream f(filePath, std::ios::binary);
-            if (!f.is_open()) {
-                push_err(out, m_sessionId, std::string("processMessage - failed to open file for write: ") + filePath);
-                return out;
-            }
-            f.write(decoded.data(), static_cast<std::streamsize>(decoded.size()));
-            if (!f.good()) {
-                push_err(out, m_sessionId, std::string("processMessage - failed writing file: ") + filePath);
-                return out;
-            }
+        if (!write_all_fd(
+                temp_file.fd,
+                reinterpret_cast<const uint8_t*>(decoded.data()),
+                decoded.size())) {
+            push_err(out, m_sessionId, std::string("processMessage - failed writing file: ") + temp_file.path);
+            return out;
         }
 
-        // track file for cleanup
-        {
-            std::lock_guard<std::mutex> lk(m_stateMutex);
-            m_Files.insert(filePath);
+        const int fd = temp_file.fd;
+        temp_file.fd = -1;
+        if (::close(fd) != 0) {
+            push_err(out, m_sessionId, std::string("processMessage - failed closing file: ") + temp_file.path);
+            return out;
         }
 
-        cJSON_AddItemToObject(jsonData, "file", cJSON_CreateString(filePath));
+        cJSON* file_item = cJSON_CreateString(temp_file.path.c_str());
+        if (!file_item) {
+            push_err(out, m_sessionId, "processMessage - failed to create file json field");
+            return out;
+        }
+        cJSON_AddItemToObject(jsonData, "file", file_item);
 
         // return rewritten jsonData as string
         char* jsonString = cJSON_PrintUnformatted(jsonData);
@@ -1154,7 +1215,12 @@ private:
         }
 
         out.rewrittenJsonData.assign(jsonString);
-        std::free(jsonString);
+        switch_safe_free(jsonString);
+        {
+            std::lock_guard<std::mutex> lk(m_stateMutex);
+            m_Files.insert(temp_file.path);
+        }
+        temp_file.keep = true;
         out.ok = SWITCH_TRUE;
         return out;
     }
@@ -1736,68 +1802,81 @@ extern "C" {
         return SWITCH_TRUE;
     }
 
-    switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
+    switch_status_t stream_session_cleanup_impl(
+        switch_core_session_t *session,
+        char* text,
+        int channelIsClosing,
+        private_t *tech_pvt_fallback
+    ) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
-        if(bug)
-        {
-            auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            char sessionId[MAX_SESSION_ID];
-            strcpy(sessionId, tech_pvt->sessionId);
-
-            std::shared_ptr<AudioStreamer>* sp_wrap = nullptr;
-            std::shared_ptr<AudioStreamer> streamer;
-
-            switch_mutex_lock(tech_pvt->mutex);
-
-            if (switch_atomic_read(&tech_pvt->cleanup_started)) {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_STATUS_SUCCESS;
-            }
-            switch_atomic_set(&tech_pvt->cleanup_started, 1);
-
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
-
-            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-
-            sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
-            tech_pvt->pAudioStreamer = nullptr;
-
-            if (sp_wrap && *sp_wrap) {
-                streamer = *sp_wrap;
-            }
-
-            switch_mutex_unlock(tech_pvt->mutex);
-
-            if (!channelIsClosing) {
-                switch_core_media_bug_remove(session, &bug);
-            }
-
-            if (sp_wrap) {
-                delete sp_wrap;
-                sp_wrap = nullptr;
-            }
-
-            if(streamer) {
-                streamer->deleteFiles();
-                if (text) streamer->writeText(text);
-                
-                streamer->markCleanedUp();
-                streamer->disconnect();
-            }
-
-            inbound_playback_session_cleanup(session, tech_pvt);
-            if (switch_atomic_read(&tech_pvt->active_stream_counted)) {
-                switch_atomic_set(&tech_pvt->active_stream_counted, 0);
-                stream_session_active_dec();
-            }
-            destroy_tech_pvt(tech_pvt);
-
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
-            return SWITCH_STATUS_SUCCESS;
+        auto* tech_pvt = bug ? (private_t*) switch_core_media_bug_get_user_data(bug) : tech_pvt_fallback;
+        if (!tech_pvt) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "stream_session_cleanup: no bug - websocket connection already closed\n");
+            return SWITCH_STATUS_FALSE;
         }
 
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "stream_session_cleanup: no bug - websocket connection already closed\n");
-        return SWITCH_STATUS_FALSE;
+        char sessionId[MAX_SESSION_ID];
+        switch_copy_string(sessionId, tech_pvt->sessionId, sizeof(sessionId));
+
+        std::shared_ptr<AudioStreamer>* sp_wrap = nullptr;
+        std::shared_ptr<AudioStreamer> streamer;
+
+        switch_mutex_lock(tech_pvt->mutex);
+
+        if (switch_atomic_read(&tech_pvt->cleanup_started)) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_STATUS_SUCCESS;
+        }
+        switch_atomic_set(&tech_pvt->cleanup_started, 1);
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
+
+        if (bug) {
+            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+        }
+
+        sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+        tech_pvt->pAudioStreamer = nullptr;
+
+        if (sp_wrap && *sp_wrap) {
+            streamer = *sp_wrap;
+        }
+
+        switch_mutex_unlock(tech_pvt->mutex);
+
+        if (bug && !channelIsClosing) {
+            switch_core_media_bug_remove(session, &bug);
+        }
+
+        if (sp_wrap) {
+            delete sp_wrap;
+            sp_wrap = nullptr;
+        }
+
+        if(streamer) {
+            if (text) streamer->writeText(text);
+            streamer->markCleanedUp();
+            streamer->deleteFiles();
+            streamer->disconnect();
+        }
+
+        inbound_playback_session_cleanup(session, tech_pvt);
+        if (switch_atomic_read(&tech_pvt->active_stream_counted)) {
+            switch_atomic_set(&tech_pvt->active_stream_counted, 0);
+            stream_session_active_dec();
+        }
+        destroy_tech_pvt(tech_pvt);
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
+        return stream_session_cleanup_impl(session, text, channelIsClosing, nullptr);
+    }
+
+    switch_status_t stream_session_cleanup_with_data(switch_core_session_t *session, char* text, int channelIsClosing, private_t *tech_pvt) {
+        return stream_session_cleanup_impl(session, text, channelIsClosing, tech_pvt);
     }
 }
