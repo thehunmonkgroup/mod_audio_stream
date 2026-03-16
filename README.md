@@ -4,13 +4,6 @@
 
 Streams real-time audio between FreeSWITCH and external systems with correct lifecycle management, thread safety and predictable memory usage.
 
-### Update (22/2/2025)
-
-#### :rocket: **Introducing Bi-Directional Streaming with Automatic Playback**
-
-A new version, **mod_audio_stream v1.0.3**, has been published, featuring raw binary audio streaming over WebSocket.
-It can be downloaded from the Releases section and is available as a pre-built Debian 12 package.
-
 The playback feature allows continuous forward streaming while playback runs independently, enabling full-duplex audio between the caller and the WebSocket endpoint.
 
 Key features:
@@ -18,29 +11,6 @@ Key features:
 - Full-duplex audio streaming (caller ↔ WebSocket)
 - Supports both base64-encoded and raw binary audio
 - Playback can be tracked, paused, and resumed dynamically
-
-🔹 This release is a **commercial product**, available for free use (including commercial use) with a `limitation of 10 concurrent streaming channels`.
-For users requiring more than 10 channels, or access to the source code, please [contact us](mailto:amsoftswitch@gmail.com) for licensing options.
-
-#### Why the Commercial Edition Exists
-
-The community edition of `mod_audio_stream` provides production-ready, uni-directional WebSocket audio streaming for ASR and real-time audio processing use cases.
-The commercial edition exists because real-world telephony systems require solving several non-trivial engineering problems that only appear under **real concurrency and production load**, such as:
-
-- correct FreeSWITCH session lifecycle management
-- thread-safe audio injection and shutdown
-- safe reconnection and cleanup under load
-- bounded and predictable memory usage
-- correct interaction with record_session / uuid_record
-
-The commercial edition is designed and tested for **high-concurrency environments (thousands of simultaneous calls, 5000+)**, where correctness, stability and resource usage are critical.
-
-### About
-
-- The purpose of `mod_audio_stream` was to provide a simple, low-dependency yet effective module for streaming audio and receiving responses from a websocket server.
-- Introduced [libwsc](https://github.com/amigniter/libwsc), our in-house, **RFC-6455 compliant** websocket client developed specifically for `mod_audio_stream`.
-  - Replaces [ixwebsocket](https://machinezone.github.io/IXWebSocket/), which served us well for the past few years. `libwsc` is libevent-based, extremely lightweight, and optimized for low-latency audio streaming.
-- This module was inspired by mod_audio_fork.
 
 ## Installation
 
@@ -431,3 +401,7 @@ Example `playback_status` response:
   "droppedOutputBytes": 0
 }
 ```
+
+## History
+
+This module is an extension of the open source work at [mod_audio_stream](https://github.com/amigniter/mod_audio_stream), which was originally inspired by [mod_audio_fork](https://github.com/dochong/drachtio-freeswitch-modules/tree/master/modules/mod_audio_fork).
