@@ -65,10 +65,14 @@ if(MOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH)
         libspeexdsp1
         zlib1g
         libevent-2.1-7
+        libevent-pthreads-2.1-7
     )
 
     if(USE_TLS)
-        list(APPEND _deb_depends libssl3)
+        list(APPEND _deb_depends
+            libevent-openssl-2.1-7
+            libssl3
+        )
     endif()
 
     list(JOIN _deb_depends ", " CPACK_DEBIAN_PACKAGE_DEPENDS)
