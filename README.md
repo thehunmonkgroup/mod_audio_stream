@@ -39,7 +39,22 @@ cpack -G DEB
 ```
 Debian package will be placed in root directory `_packages` folder.
 The default DEB package targets distro-installed FreeSWITCH and lets Debian tooling derive shared-library dependencies automatically.
-If FreeSWITCH was built from source and installed locally, add `-DMOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH=ON` to the cmake line. The local variant does not declare a Debian package dependency for FreeSWITCH, so the target system must already provide `libfreeswitch.so.1` through an existing FreeSWITCH installation and runtime linker configuration.
+If FreeSWITCH was built from source and installed locally, add `-DMOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH=ON` to the cmake line. The local variant installs `mod_audio_stream.so` to `/usr/lib/mod-audio-stream` by default instead of `/usr/local/freeswitch/mod`, and it does not declare a Debian package dependency for FreeSWITCH. The target system must already provide `libfreeswitch.so.1` through an existing FreeSWITCH installation and runtime linker configuration.
+
+To override the module install directory, pass `MOD_AUDIO_STREAM_MODULE_INSTALL_DIR` when configuring:
+```
+cmake -DCMAKE_BUILD_TYPE=Release \
+    -DMOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH=ON \
+    -DMOD_AUDIO_STREAM_MODULE_INSTALL_DIR=/usr/lib/mod-audio-stream \
+    ..
+```
+
+To load the module from that custom location, add a `path` attribute to the module entry in `modules.conf.xml`:
+```
+<load module="mod_audio_stream" path="/usr/lib/mod-audio-stream"/>
+```
+
+Common `modules.conf.xml` locations are `/usr/local/freeswitch/conf/autoload_configs/modules.conf.xml` for source-built FreeSWITCH and `/etc/freeswitch/autoload_configs/modules.conf.xml` for distro packages.
 
 ## Scripted Build & Installation
 

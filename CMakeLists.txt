@@ -26,7 +26,19 @@ find_package(SpeexDSP REQUIRED)
 
 pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
 pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
+
+if(MOD_AUDIO_STREAM_DEB_LOCAL_FREESWITCH)
+    set(_mod_audio_stream_default_module_install_dir "/usr/lib/mod-audio-stream")
+else()
+    set(_mod_audio_stream_default_module_install_dir "${FS_MOD_DIR}")
+endif()
+
+set(MOD_AUDIO_STREAM_MODULE_INSTALL_DIR
+    "${_mod_audio_stream_default_module_install_dir}"
+    CACHE PATH "Install directory for mod_audio_stream.so")
+
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
+message(STATUS "mod_audio_stream install dir: ${MOD_AUDIO_STREAM_MODULE_INSTALL_DIR}")
 
 add_subdirectory(libs/libwsc)
 
@@ -107,7 +119,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/copyright"
 
 install(TARGETS ${PROJECT_NAME}
         COMPONENT ${PROJECT_NAME}
-        DESTINATION ${FS_MOD_DIR})
+        DESTINATION "${MOD_AUDIO_STREAM_MODULE_INSTALL_DIR}")
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/changelog.gz"
 	DESTINATION "${CMAKE_INSTALL_DOCDIR}"
