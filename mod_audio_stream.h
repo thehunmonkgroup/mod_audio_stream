@@ -21,13 +21,23 @@
 #define EVENT_STREAM_AUDIO_PLAYBACK_COMPLETE "mod_audio_stream::stream_audio_playback_complete"
 #define EVENT_STREAM_AUDIO_PLAYBACK_CANCELLED "mod_audio_stream::stream_audio_playback_cancelled"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char* eventName, const char* json);
+typedef switch_status_t (*serverMessageHandler_t)(switch_core_session_t* session, const char* text);
+
+#ifdef __cplusplus
+}
+#endif
 
 struct private_data {
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
     SpeexResamplerState *resampler;
     responseHandler_t responseHandler;
+    serverMessageHandler_t serverMessageHandler;
     void *pAudioStreamer;
     void *pInboundPlayback;
     char ws_uri[MAX_WS_URI];

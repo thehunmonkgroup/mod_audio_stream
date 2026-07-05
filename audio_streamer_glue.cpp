@@ -1,7 +1,7 @@
 #include <string>
 #include <cstring>
 #include <cerrno>
-#include "mod_audio_stream.h"
+#include "audio_streamer_glue.h"
 #include "inbound_playback.h"
 #include "WebSocketClient.h"
 #include "Utf8Validator.h"
@@ -1423,6 +1423,7 @@ namespace {
         switch_copy_string(tech_pvt->ws_uri, wsUri, sizeof(tech_pvt->ws_uri));
         tech_pvt->sampling = desiredSampling;
         tech_pvt->responseHandler = responseHandler;
+        tech_pvt->serverMessageHandler = stream_session_send_text;
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
         switch_atomic_set(&tech_pvt->audio_paused, 0);
@@ -1599,7 +1600,7 @@ extern "C" {
         return SWITCH_STATUS_SUCCESS;
     }
 
-    switch_status_t stream_session_send_text(switch_core_session_t *session, char* text) {
+    switch_status_t stream_session_send_text(switch_core_session_t *session, const char* text) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
         if (!bug) {

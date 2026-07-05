@@ -347,7 +347,7 @@ Emitted when the module begins writing the live inbound playback stream to the c
 **Name**: mod_audio_stream::stream_audio_playback_complete
 **Body**: JSON
 
-Emitted after a live inbound playback stream has been ended and all buffered audio has drained.
+Emitted after a live inbound playback stream has been ended and all buffered audio has drained. At this same lifecycle point, `mod_audio_stream` also sends a `streamAudioPlaybackComplete` websocket message back to the server.
 ```json
 {
   "type": "streamAudioPlaybackComplete",
@@ -387,6 +387,15 @@ Then send websocket binary frames containing raw `pcm_s16le` audio. End the live
   "type": "streamAudioEnd"
 }
 ```
+
+After `streamAudioEnd`, `mod_audio_stream` waits until all buffered audio has been written to the call media stream. When playback has fully drained, it sends this websocket text message back to the server:
+```json
+{
+  "type": "streamAudioPlaybackComplete",
+  "playbackId": "call-123:inbound_tts:1"
+}
+```
+This message is not sent for `streamAudioCancel`, `playback_stop`, disconnect, cleanup, or playback errors.
 
 To interrupt active live playback immediately, send:
 ```json

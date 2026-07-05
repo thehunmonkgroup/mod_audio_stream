@@ -114,6 +114,7 @@ struct InboundPlaybackState {
     InboundPlaybackState(
         std::string session_id,
         responseHandler_t response_handler,
+        serverMessageHandler_t server_message_handler,
         uint32_t target_rate,
         uint32_t target_channels,
         uint32_t packet_ms,
@@ -124,6 +125,7 @@ struct InboundPlaybackState {
     )
         : session_id(std::move(session_id)),
           response_handler(response_handler),
+          server_message_handler(server_message_handler),
           target_rate(target_rate),
           target_channels(target_channels),
           packet_ms(packet_ms),
@@ -148,6 +150,7 @@ struct InboundPlaybackState {
 
     std::string session_id;
     responseHandler_t response_handler = nullptr;
+    serverMessageHandler_t server_message_handler = nullptr;
     uint32_t target_rate = 8000;
     uint32_t target_channels = 1;
     uint32_t packet_ms = 20;
@@ -315,6 +318,43 @@ void emit_playback_event(
     }
 
     state->response_handler(session, event_name, payload.c_str());
+}
+
+void send_playback_complete_to_server(
+    InboundPlaybackState *state,
+    switch_core_session_t *session,
+    const std::string &playback_id
+) {
+    if (!state || !session || playback_id.empty()) {
+        return;
+    }
+
+    const std::string payload = build_event_payload(
+        "streamAudioPlaybackComplete",
+        playback_id
+    );
+    if (payload.empty()) {
+        return;
+    }
+
+    if (!state->server_message_handler) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_WARNING,
+            "mod_audio_stream: no server message handler for streamAudioPlaybackComplete playback_id=%s\n",
+            playback_id.c_str()
+        );
+        return;
+    }
+
+    if (state->server_message_handler(session, payload.c_str()) != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(
+            SWITCH_CHANNEL_SESSION_LOG(session),
+            SWITCH_LOG_WARNING,
+            "mod_audio_stream: failed sending streamAudioPlaybackComplete playback_id=%s\n",
+            playback_id.c_str()
+        );
+    }
 }
 
 std::string resolve_playback_id(
@@ -592,6 +632,7 @@ switch_status_t write_next_frame(switch_core_session_t *session, InboundPlayback
     }
 
     if (should_log_completion) {
+        send_playback_complete_to_server(state, session, playback_complete_id);
         emit_playback_event(
             state,
             session,
@@ -849,6 +890,7 @@ switch_status_t inbound_playback_session_init(switch_core_session_t *session, pr
     auto state = std::make_shared<InboundPlaybackState>(
         tech_pvt->sessionId,
         tech_pvt->responseHandler,
+        tech_pvt->serverMessageHandler,
         target_rate,
         target_channels,
         packet_ms,
